@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import copy
+import asyncio
+from bson import BSON
+from src.utils.jjc_equipment_candidates import build_local_win_candidate_pipeline
+from src.utils.jjc_equipment_time import (EQUIPMENT_TIME_FIELD, EQUIPMENT_VALID_FIELD,
+    EQUIPMENT_WINNERS_FIELD, EQUIPMENT_MATCH_FIELD, equipment_source_index)
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -9,8 +15,12 @@ from bson import ObjectId
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from nonebot import logger
+from src.utils.jjc_query_observability import foreground_safe_logger
+
+logger = foreground_safe_logger(logger, component="inspect_repo")
 
 from src.infra.mongo import get_db as _get_db
+from src.utils.jjc_indicator_cache import indicator_cache_age, normalize_indicator_scope
 from src.services.jx3.match_detail_snapshots import (
     TALENT_SNAPSHOT_SCHEMA_VERSION,
     build_equipment_snapshot,
@@ -25,6 +35,188 @@ class JjcInspectRepo:
     db: Optional[AsyncIOMotorDatabase] = None
     snapshot_repo: JjcMatchSnapshotRepo = field(default_factory=JjcMatchSnapshotRepo)
     participant_repo: Any = field(default_factory=JjcMatchParticipantRepo)
+
+    async def list_local_win_candidates_batch(self, global_ids, *, season_start, checked_at, max_time_ms=1500, season_id=None):
+        """Read per-role maxima in bounded unions, then consume disjoint source chunks."""
+        if (not isinstance(global_ids, list) or len(global_ids) > 1000
+                or any(not isinstance(gid, str) or not gid.isascii() or not gid.isdigit()
+                       or len(gid) > 19 or not 0 < int(gid) <= 9223372036854775807 for gid in global_ids)
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) or value <= 0 for value in (season_start, checked_at))
+                or checked_at < season_start or type(max_time_ms) is not int or not 0 < max_time_ms <= 1500):
+            raise ValueError("invalid_local_win_read")
+        if not global_ids:
+            return []
+        db = self.db if self.db is not None else _get_db()
+        ids = list(dict.fromkeys(global_ids))
+        projection = build_local_win_candidate_pipeline(ids[:100], season_start=season_start,
+            checked_at=checked_at, season_id=season_id)[1]["$project"]
+        metadata_fields = (EQUIPMENT_TIME_FIELD, EQUIPMENT_VALID_FIELD,
+                           EQUIPMENT_WINNERS_FIELD, EQUIPMENT_MATCH_FIELD)
+        projection.update({field: 1 for field in metadata_fields})
+        semaphore = asyncio.Semaphore(4)
+        closing = set()
+
+        async def consume(cursor):
+            try:
+                return [doc async for doc in cursor]
+            finally:
+                task = asyncio.current_task()
+                closing.add(task)
+                try:
+                    await cursor.close()
+                finally:
+                    closing.discard(task)
+
+        async def collect(arguments, reader):
+            stopped = asyncio.Event()
+            arguments = iter(enumerate(arguments))
+            async def owned():
+                completed = []
+                while not stopped.is_set():
+                    try:
+                        index, argument = next(arguments)
+                    except StopIteration:
+                        break
+                    async with semaphore:
+                        if stopped.is_set():
+                            raise asyncio.CancelledError()
+                        completed.append((index, await reader(argument, stopped)))
+                return completed
+            tasks = [asyncio.create_task(owned()) for _ in range(4)]
+            group = asyncio.gather(*tasks)
+            try:
+                completed = await asyncio.shield(group)
+                return [value for _, value in sorted(
+                    (item for worker in completed for item in worker), key=lambda item: item[0])]
+            except BaseException:
+                stopped.set()
+                # Never interrupt a cursor already performing its async close.
+                for task in tasks:
+                    if not task.done() and task not in closing:
+                        task.cancel()
+                drain = asyncio.gather(*tasks, return_exceptions=True)
+                while not drain.done():
+                    try:
+                        await asyncio.shield(drain)
+                    except asyncio.CancelledError:
+                        continue
+                if group.done() and not group.cancelled():
+                    group.exception()
+                raise
+
+        async def discover(argument, stopped):
+            kind, value = argument
+            if kind == "winner":
+                def winner_branch(gid):
+                    return [
+                        {"$match": {EQUIPMENT_WINNERS_FIELD: gid,
+                            EQUIPMENT_TIME_FIELD: {"$gte": season_start, "$lte": checked_at}}},
+                        {"$sort": {EQUIPMENT_TIME_FIELD: -1, EQUIPMENT_MATCH_FIELD: -1, "_id": 1}},
+                        {"$limit": 1},
+                        {"$project": {"_id": 1, EQUIPMENT_TIME_FIELD: 1,
+                            EQUIPMENT_MATCH_FIELD: 1, "__equipment_requested_gid": {"$literal": gid}}},
+                    ]
+                # Union branches retain each exact indexed maximum. Their
+                # output order is unspecified; the literal tag owns each result.
+                pipeline = winner_branch(value[0])
+                for gid in value[1:]:
+                    pipeline.append({"$unionWith": {"coll": "jjc_match_detail", "pipeline": winner_branch(gid)}})
+                cursor = db.jjc_match_detail.aggregate(pipeline,
+                    hint="idx_equipment_winner_latest_v1", maxTimeMS=max_time_ms, batchSize=64)
+            else:
+                side, batch, branch = value
+                query = {"data.detail." + side + ".players_info.global_id": {"$in": batch}}
+                if branch == "invalid_current":
+                    query.update({EQUIPMENT_VALID_FIELD: False, EQUIPMENT_TIME_FIELD: {"$gte": season_start}})
+                elif branch == "invalid_null":
+                    query.update({EQUIPMENT_VALID_FIELD: False, EQUIPMENT_TIME_FIELD: None})
+                elif branch == "future":
+                    query.update({EQUIPMENT_VALID_FIELD: True, EQUIPMENT_TIME_FIELD: {"$gt": checked_at}})
+                else:
+                    query[EQUIPMENT_VALID_FIELD] = None
+                cursor = db.jjc_match_detail.find(query, {"_id": 1}).hint(
+                    "idx_equipment_" + side + "_state_time_source_v1").max_time_ms(max_time_ms).batch_size(8192)
+            rows = await consume(cursor)
+            if stopped.is_set():
+                raise asyncio.CancelledError()
+            if any("_id" not in row for row in rows):
+                raise ValueError("missing_candidate_source_id")
+            if kind == "winner":
+                seen_gids = set()
+                for row in rows:
+                    requested = row.get("__equipment_requested_gid")
+                    if (not isinstance(requested, str) or requested not in value
+                            or requested in seen_gids):
+                        raise ValueError("candidate_source_changed")
+                    seen_gids.add(requested)
+            return kind, value, rows
+
+        def arguments():
+            for offset in range(0, len(ids), 25):
+                yield "winner", ids[offset:offset+25]
+            for offset in range(0, len(ids), 100):
+                for side in ("team1", "team2"):
+                    for branch in ("invalid_current", "invalid_null", "legacy", "future"):
+                        yield "other", (side, ids[offset:offset+100], branch)
+
+        sources, source_keys, expected = [], set(), {}
+        observations = await collect(arguments(), discover)
+        for kind, value, rows in observations:
+            for row in rows:
+                key = BSON.encode({"_id": row["_id"]})
+                if key not in source_keys:
+                    source_keys.add(key)
+                    sources.append(row["_id"])
+                if kind == "winner":
+                    stamp, mid = row.get(EQUIPMENT_TIME_FIELD), row.get(EQUIPMENT_MATCH_FIELD)
+                    if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                            or not math.isfinite(stamp) or not season_start <= stamp <= checked_at
+                            or isinstance(mid, bool) or not isinstance(mid, int)
+                            or not 0 < mid <= 9223372036854775807):
+                        raise ValueError("candidate_source_changed")
+                    prior = expected.setdefault(key, {"time": stamp, "mid": mid, "gids": set()})
+                    if prior["time"] != stamp or prior["mid"] != mid:
+                        raise ValueError("candidate_source_changed")
+                    prior["gids"].add(row["__equipment_requested_gid"])
+        del observations
+        if not sources:
+            return []
+
+        async def read_sources(batch, stopped):
+            cursor = db.jjc_match_detail.find({"_id": {"$in": batch}}, projection).hint(
+                "_id_").max_time_ms(max_time_ms).batch_size(64)
+            rows = await consume(cursor)
+            if stopped.is_set():
+                raise asyncio.CancelledError()
+            found = {BSON.encode({"_id": row["_id"]}) for row in rows if "_id" in row}
+            if found != {BSON.encode({"_id": source}) for source in batch}:
+                raise ValueError("candidate_source_disappeared")
+            for row in rows:
+                observed = expected.get(BSON.encode({"_id": row["_id"]}))
+                if observed is None:
+                    continue
+                # Same document version supplies raw data and its atomic index
+                # metadata. A later presence read cannot prove this snapshot.
+                actual = equipment_source_index(row.get("match_id"), row.get("data"))
+                if (row.get(EQUIPMENT_VALID_FIELD) is not True or actual[EQUIPMENT_VALID_FIELD] is not True
+                        or any(row.get(field) != actual[field] for field in metadata_fields)
+                        or actual[EQUIPMENT_TIME_FIELD] != observed["time"]
+                        or actual[EQUIPMENT_MATCH_FIELD] != observed["mid"]
+                        or not observed["gids"].issubset(set(actual[EQUIPMENT_WINNERS_FIELD]))):
+                    raise ValueError("candidate_source_changed")
+            return rows
+
+        batches = await collect((sources[offset:offset+256]
+            for offset in range(0, len(sources), 256)), read_sources)
+        rows = []
+        for batch in batches:
+            for doc in batch:
+                row = dict(doc)
+                for field in ("_id",) + metadata_fields:
+                    row.pop(field, None)
+                rows.append(row)
+        return rows
 
     async def load_role_recent(self, server: str, name: str, *, ttl_seconds: int) -> Optional[dict[str, Any]]:
         db = self.db if self.db is not None else _get_db()
@@ -99,6 +291,7 @@ class JjcInspectRepo:
             {"$set": {
                 "cached_at": cached_at,
                 "data": mongo_data,
+                **equipment_source_index(normalized_id, mongo_data),
             }},
             upsert=True,
         )
@@ -142,6 +335,7 @@ class JjcInspectRepo:
                 {"$set": {
                     "cached_at": cached_at,
                     "data": compacted_data,
+                    **equipment_source_index(normalized_id, compacted_data),
                 }},
                 upsert=False,
             )
@@ -153,6 +347,7 @@ class JjcInspectRepo:
                 error=str(exc),
             ).warning("JJC 对局详情快照派生失败")
         return True
+
 
     async def _hydrate_match_detail(self, doc: dict[str, Any], match_id: int) -> bool:
         """Fill players_info[].armors/talents from snapshot hashes in-place.
@@ -843,58 +1038,61 @@ class JjcInspectRepo:
             "team2": teams.get("team2", {"won": False, "players": []}),
         }
 
-    async def save_role_indicator(self, cache_key: str, payload: dict[str, Any]) -> None:
+    async def save_role_indicator(self, cache_key: str, payload: dict[str, Any], *, strict: bool = False) -> None:
+        scope = normalize_indicator_scope(payload.get("scope"))
+        if "scope" in payload and scope is None:
+            # Explicit invalid metadata must not be erased into legacy fresh
+            # eligibility. Reject before any DB access, for every writer.
+            raise ValueError("invalid_indicator_scope")
         db = self.db if self.db is not None else _get_db()
+        fields = {key: payload.get(key) for key in (
+            "identity_id", "identity_key", "role_id", "server", "name", "game_role_id",
+            "global_id", "global_role_id", "zone",
+        )}
+        fields.update(cache_key=cache_key, indicator=payload.get("indicator") or {},
+                      raw=payload.get("raw") or {}, cached_at=payload.get("cached_at", time.time()))
+        update: dict[str, Any] = {"$set": fields}
+        if scope is not None:
+            fields["scope"] = scope
+        else:
+            # Prewarm/legacy writers must replace scope in the very same write
+            # as raw, metrics, timestamp and identity binding.
+            update["$unset"] = {"scope": ""}
         try:
-            await db.jjc_role_indicator.update_one(
-                {"cache_key": cache_key},
-                {"$set": {
-                    "cache_key": cache_key,
-                    "identity_key": payload.get("identity_key"),
-                    "server": payload.get("server"),
-                    "name": payload.get("name"),
-                    "game_role_id": payload.get("game_role_id"),
-                    "global_id": payload.get("global_id"),
-                    "global_role_id": payload.get("global_role_id"),
-                    "zone": payload.get("zone"),
-                    "indicator": payload.get("indicator") or {},
-                    "raw": payload.get("raw") or {},
-                    "cached_at": payload.get("cached_at") or time.time(),
-                }},
-                upsert=True,
-            )
+            await db.jjc_role_indicator.update_one({"cache_key": cache_key}, update, upsert=True)
         except Exception as exc:
+            if strict:
+                raise
             logger.warning(f"保存 JJC 角色 indicator 缓存失败: cache_key={cache_key} error={exc}")
 
-    async def load_role_indicator(self, cache_key: str, *, ttl_seconds: int = 600) -> Optional[dict[str, Any]]:
+    async def load_role_indicator(self, cache_key: str, *, ttl_seconds: int = 600,
+                                  max_age_seconds: Optional[float] = None,
+                                  strict: bool = False) -> Optional[dict[str, Any]]:
+        """Read one indexed key; an extended window does not make data fresh."""
         db = self.db if self.db is not None else _get_db()
         try:
             doc = await db.jjc_role_indicator.find_one({"cache_key": cache_key})
         except Exception as exc:
+            if strict:
+                raise
             logger.warning(f"读取 JJC 角色 indicator 缓存失败: cache_key={cache_key} error={exc}")
             return None
         if doc is None:
             return None
-        cached_at = doc.get("cached_at")
-        if not isinstance(cached_at, (int, float)):
+        age = indicator_cache_age(doc.get("cached_at"), time.time())
+        limit = ttl_seconds if max_age_seconds is None else max_age_seconds
+        if age is None or age >= limit:
             return None
-        if time.time() - float(cached_at) > ttl_seconds:
-            logger.info(f"JJC 角色 indicator 缓存已过期: cache_key={cache_key}")
-            return None
-        return {
-            "cache_key": doc.get("cache_key"),
-            "identity_key": doc.get("identity_key"),
-            "server": doc.get("server"),
-            "name": doc.get("name"),
-            "game_role_id": doc.get("game_role_id"),
-            "global_id": doc.get("global_id"),
-            "global_role_id": doc.get("global_role_id"),
-            "role_id": doc.get("role_id"),
-            "zone": doc.get("zone"),
-            "indicator": doc.get("indicator") or {},
-            "raw": doc.get("raw") or {},
-            "cached_at": cached_at,
-        }
+        result = {key: doc.get(key) for key in (
+            "cache_key", "identity_id", "identity_key", "server", "name", "game_role_id",
+            "global_id", "global_role_id", "role_id", "zone", "cached_at",
+        )}
+        result.update(indicator=doc.get("indicator") or {}, raw=doc.get("raw") or {})
+        # Missing and malformed scope are different: malformed must not silently
+        # become a legacy fresh record when the service evaluates it.
+        if "scope" in doc:
+            result["scope"] = copy.deepcopy(doc["scope"])
+        return result
 
     def _prepare_snapshots(self, data: dict[str, Any]) -> List[Dict[str, Any]]:
         """Replace player payloads with hashes and return the snapshots to persist."""

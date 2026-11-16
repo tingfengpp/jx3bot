@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,6 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from nonebot import logger
+from src.utils.jjc_query_observability import foreground_safe_logger
+
+logger = foreground_safe_logger(logger, component="identity_repo")
 from pymongo.errors import DuplicateKeyError
 
 from src.infra.mongo import get_db as _get_db
@@ -92,6 +96,55 @@ def _coerce_object_id(value: Any) -> Optional[ObjectId]:
     if isinstance(value, str) and ObjectId.is_valid(value):
         return ObjectId(value)
     return None
+
+
+def _display_publication_fields(identity_id: ObjectId, locator: Dict[str, Any], generation: int,
+                                result: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the semantic delta before constructing constant Mongo field paths."""
+    allowed = {"attempt", "current", "last_complete", "no_win_version", "no_win_context"}
+    if not isinstance(update, dict) or "attempt" not in update or set(update) - allowed:
+        raise ValueError("invalid display delta")
+    scope = {key: result.get(key) for key in ("season_id", "season_start", "pvp_type", "algorithm_version")}
+    context = {"identity_id": str(identity_id), "scope": scope, "locator": locator}
+    for key in ("attempt", "current", "last_complete"):
+        if key not in update:
+            continue
+        item = update[key]
+        if (not isinstance(item, dict) or not isinstance(item.get("publish_version"), int)
+                or isinstance(item.get("publish_version"), bool) or item["publish_version"] != generation
+                or any(item.get(k) != v for k, v in context.items())
+                or not isinstance(item.get("scope"), dict)
+                or any(type(item["scope"].get(k)) is not type(v) for k, v in scope.items())):
+            raise ValueError("invalid display binding")
+        for stamp in ("requested_at", "verified_at"):
+            value = item.get(stamp)
+            if (type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                    or value != result.get(stamp)):
+                raise ValueError("invalid display time")
+        if item["requested_at"] > item["verified_at"]:
+            raise ValueError("invalid display time order")
+    state = update["attempt"].get("state")
+    if state not in ("full", "partial", "failed", "no_win"):
+        raise ValueError("invalid display state")
+    packet = update.get("current")
+    if (state in ("full", "partial")) != (packet is not None):
+        raise ValueError("invalid display packet state")
+    if packet is not None:
+        if (type(packet.get("team_ready")) is not bool or type(packet.get("weapon_ready")) is not bool
+                or not (packet["team_ready"] or packet["weapon_ready"])
+                or (state == "full") != (packet["team_ready"] and packet["weapon_ready"])):
+            raise ValueError("invalid display completeness")
+    if (state == "full") != ("last_complete" in update) or (
+            "last_complete" in update and update["last_complete"] != packet):
+        raise ValueError("invalid complete display packet")
+    if state == "no_win":
+        version = update.get("no_win_version")
+        if (not isinstance(version, int) or isinstance(version, bool) or version != generation
+                or update.get("no_win_context") != context):
+            raise ValueError("invalid no-win watermark")
+    elif "no_win_version" in update or "no_win_context" in update:
+        raise ValueError("unexpected no-win watermark")
+    return {"jjc_display." + key: value for key, value in update.items()}
 
 
 def _global_id_string_filter(global_id: str) -> Dict[str, str]:
@@ -544,6 +597,7 @@ class RoleIdentityRepo:
     async def publish_jjc_kungfu_if_newer(
         self, identity_id: Any, expected_locator: Dict[str, Any],
         generation: int, result: Dict[str, Any],
+        *, display_update: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Publish one newer result without touching the identity observation clock."""
         object_id = _coerce_object_id(identity_id)
@@ -552,6 +606,9 @@ class RoleIdentityRepo:
                 or result["publish_version"] != generation):
             raise ValueError("invalid role kungfu publication version")
         query: Dict[str, Any] = {"_id": object_id}
+        fields = {"jjc_kungfu": dict(result)}
+        if display_update is not None:
+            fields.update(_display_publication_fields(object_id, expected_locator, generation, result, display_update))
         for field in ("server", "name", "zone", "game_role_id", "role_id", "global_id", "global_role_id"):
             if field not in expected_locator:
                 query[field] = {"$exists": False}
@@ -568,7 +625,7 @@ class RoleIdentityRepo:
                 {"$lt": ["$jjc_kungfu.publish_version", generation]},
             ]}},
         ]
-        updated = await self._col().update_one(query, {"$set": {"jjc_kungfu": dict(result)}})
+        updated = await self._col().update_one(query, {"$set": fields})
         return updated.matched_count == 1
 
     async def resolve_best_identity(
@@ -705,6 +762,7 @@ class RoleIdentityRepo:
         person_id: Optional[str] = None,
         global_id: Optional[str] = None,
         cache_repo: Any = None,
+        preserve_id: bool = False,
     ) -> Dict[str, Any]:
         """从 indicator 接口数据写入或升级身份。"""
         return await self._upsert_identity(
@@ -712,6 +770,7 @@ class RoleIdentityRepo:
             global_role_id=global_role_id, role_id=role_id, person_id=person_id,
             global_id=global_id,
             source="indicator", cache_repo=cache_repo,
+            **({"preserve_id": True} if preserve_id else {}),
         )
 
     async def upsert_from_match_detail(
@@ -1256,3 +1315,23 @@ class RoleIdentityRepo:
                 )
             )
             return False
+
+    async def get_equipment_bindings_by_ids(self, ids: List[Any]) -> List[Dict[str, Any]]:
+        """Strict identity-only batch for equipment reads; never fetch display packets."""
+        object_ids = list(dict.fromkeys(object_id for object_id in map(_coerce_object_id, ids)
+                                        if object_id is not None))
+        if not object_ids:
+            return []
+        projection = {"_id": 1, **{key: 1 for key in (
+            "server", "name", "zone", "game_role_id", "role_id", "global_id", "global_role_id")}}
+        return await self._col().find({"_id": {"$in": object_ids}}, projection).max_time_ms(1500).to_list(None)
+
+    async def get_display_by_ids(self, ids: List[Any]) -> List[Dict[str, Any]]:
+        """Read only display bindings and packets in one _id batch; never hydrate."""
+        object_ids = list(dict.fromkeys(object_id for object_id in map(_coerce_object_id, ids)
+                                        if object_id is not None))
+        if not object_ids:
+            return []
+        projection = {"_id": 1, "jjc_display": 1, **{key: 1 for key in (
+            "server", "name", "zone", "game_role_id", "role_id", "global_id", "global_role_id")}}
+        return await self._col().find({"_id": {"$in": object_ids}}, projection).to_list(None)

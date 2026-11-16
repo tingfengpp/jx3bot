@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import inspect
 
 from typing import Any, Awaitable, Callable, Optional
 
@@ -93,10 +94,14 @@ def register(
                 await bot.send(event, "心法统计数据为空，无法生成统计图片")
                 return
 
-            if any(key in result for key in ("kungfu_cache_scope", "refresh_degraded", "_sync_request")):
-                save_ranking_stats(ranking_result, stats, week_info, payload=result)
+            if any(key in result for key in ("kungfu_cache_scope", "refresh_degraded", "_sync_request", "equipment_view")):
+                save_task = save_ranking_stats(ranking_result, stats, week_info, payload=result)
             else:
-                save_ranking_stats(ranking_result, stats, week_info)
+                save_task = save_ranking_stats(ranking_result, stats, week_info)
+            if result.get("equipment_view") is not None and save_task is None:
+                raise RuntimeError("equipment_publication_unavailable")
+            if inspect.isawaitable(save_task):
+                await save_task
 
             if is_split_mode:
                 await generate_split_ranking_images(bot, event, stats, week_info, show_legendary)

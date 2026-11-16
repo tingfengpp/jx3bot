@@ -248,3 +248,8 @@ python -m py_compile src/plugins/config_manager.py src/plugins/jx3bot_handlers/j
 
 
 JJC排名心法缓存新增边界：`jjc_kungfu_classifier.py` / `jjc_kungfu_policy.py` 承载纯选择和时效；`jjc_kungfu_refresh.py` 编排条件发布和重试；`jjc_kungfu_refresh_runtime.py` 管理单本地循环，bot挂接生命周期。`infra/tuilan_kungfu_client.py` 仅返回两类原始证据，身份与队列repo分别持久化属性/任务；`singletons.py` 只装配，策略按需校验。排名服务批量读画像并登记任务，展示消费冻结coverage/成员证据。设计与验证记录为 `openspec/changes/jjc-ranking-kungfu-async-refresh/`，无新通用队列或分布式leader层。
+
+
+## 排行榜装备视图
+
+`jjc_ranking_equipment` 负责最新胜场业务验证，`jjc_ranking_equipment_view` 负责整榜统一视图与缓存，`jjc_equipment_read_runtime` 管理专用只读连接生命周期。API/两个网页入口共用同一视图版本的装备、橙武计数和紫武筛选。`jjc_ranking_display` 和 foreground runtime 提供已发布的查询展示依赖；本次提交不包含未发布 prefetch。装备规则和索引表达式置于 utils，仓储负责完整读取与严格异常传播。

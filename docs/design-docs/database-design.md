@@ -1109,3 +1109,18 @@
 每轮排名统计产生独立请求上下文，在 QQ/定时入口传给保存补偿；不依赖 cache_time 唯一性。同一角色非 disabled/syncing 时立即 queued，清角色冷却，保留失败审计与既有水位。syncing 只写 pending；有效租约释放 CAS 比较 request_order，有 pending 则发布本轮结果并 queued，否则按原冷却/失败规则释放并清 front。过期恢复逐文档执行同样 CAS，保留最新请求。ranking_request_order 不随成功清除，避免同轮保存补偿重复执行。
 
 回滚必须先停所有生产者和消费者，物化 pending 为普通 queued 并清 front/pending；不能仅回退旧 worker，否则 pending 无人处理。完整步骤见 runbook 与 change tasks.md。顺序使用部署主机时间，要求参与实例系统时钟同步；不提供跨主机独立时钟的全局顺序服务。
+
+
+## 排行榜本地最新胜场读索引（v1）
+
+`jjc_match_detail` 新增根字段 `equipment_read_time_v1`、`equipment_read_valid_v1`、`equipment_winner_gids_v1`、`equipment_match_id_v1`。`src/utils/jjc_equipment_time.py` 的 `equipment_source_index` 在主表保存时与原文原子写入；未知/冲突形状保持无有效证书。`build_equipment_source_update_pipeline` 提供 Mongo 4.4 保守回填表达式。它们只派生读索引元数据，不改对局事实、参与者投影或同步水位。
+
+必须预先准备以下非唯一索引（开启新开关前备份、受控回填并核对执行计划）：
+
+- `idx_equipment_winner_latest_v1`: `equipment_winner_gids_v1:1, equipment_read_time_v1:-1, equipment_match_id_v1:-1, _id:1`。
+- `idx_equipment_team1_state_time_source_v1`: `data.detail.team1.players_info.global_id:1, equipment_read_valid_v1:1, equipment_read_time_v1:1, _id:1`。
+- `idx_equipment_team2_state_time_source_v1`: 同上一索引，将 team1 换成 team2。
+
+查询先按角色取有证书的最新胜场源 ID，同时完整收集未认证、当前异常及未来时间证据，再分块按物理 `_id` 读取原文并验证原文与元数据。每角色 limit 1 仅用于已证明合法胜场的最大值计算；异常证据不截断，最终全榜仍完整。源消失或版本变化使本次视图失败。
+
+新快照使用装备 schema 2；回滚优先关闭 LOCAL 开关并保留兼容 reader，不把新快照交给不识别 schema 2 的旧二进制，不清事实、队列和水位。

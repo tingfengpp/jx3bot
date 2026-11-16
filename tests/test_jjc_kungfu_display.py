@@ -76,6 +76,8 @@ class KungfuDisplayTests(unittest.IsolatedAsyncioTestCase):
 const assert = require('node:assert/strict');
 let currentStats = {kungfu_statistics:{top_50:{healer:{equipment_incomplete:true},dps:{equipment_incomplete:true}}}};
 let currentStatsTimestamp = 1793923200;
+// This fixture exercises the unchanged legacy branch.
+let equipmentViewState = null;
 let grid = {innerHTML:''};
 let calls = 0;
 let rankingListCache = new Map();
@@ -156,5 +158,9 @@ for (const state of ['fresh','stale','unknown',undefined]) {
 }
 assert.equal(JSON.stringify(range),before,'rendering and filtering must not mutate snapshot input');
 """
-        result = subprocess.run([node,"-e",harness+details+distribution+export+check],capture_output=True,text=True)
+        actual_peak = page[page.index("        function isPeakTab("):page.index("        function getOuterTabLabel(")]
+        display_helpers = page.split("// BEGIN RANKING DISPLAY HELPERS", 1)[1].split("// END RANKING DISPLAY HELPERS", 1)[0]
+        icon_catalog = page[page.index("        const kungfuIconIdByName = {"):page.index("        const subtitle =")]
+        icon_resolver = page[page.index("        function resolveKungfuIconId("):page.index("        function renderTeamKungfuIconsInline(")]
+        result = subprocess.run([node,"-e",harness+icon_catalog+icon_resolver+actual_peak+display_helpers+details+distribution+export+check],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)

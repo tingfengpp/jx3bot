@@ -4,11 +4,15 @@ import asyncio
 import copy
 import time
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from nonebot import logger
+from src.utils.jjc_query_observability import foreground_safe_logger, observed_query_stage
+
+logger = foreground_safe_logger(logger, component="ranking")
 import config as cfg
 
 from src.services.jx3.indicator_utils import parse_3v3_indicator
@@ -17,14 +21,18 @@ from src.services.jx3.kungfu import get_role_indicator, get_kungfu_detail_by_rol
 from src.services.jx3.weapon_quality import extract_member_weapon_name, extract_weapon_name, is_jjc_legendary_weapon
 from src.infra.mongo import get_db
 from src.services.jx3.jjc_api_client import JjcApiClient
+from src.services.jx3.jjc_role_query_context import ForegroundQueryError, ForegroundQueryTimeout
+from src.infra.jjc_foreground_mongo import ForegroundMongoFailure
 from src.services.jx3.jjc_cache_repo import JjcCacheRepo
 from src.services.jx3.jjc_kungfu_policy import KungfuPolicy, make_scope
 from src.services.jx3.jjc_kungfu_meta import get_jjc_kungfu_catalog
+from src.services.jx3.jjc_ranking_display import display_context
 from src.storage.mongo_repos.role_identity_repo import RoleIdentityRepo
 from src.storage.mongo_repos.jjc_kungfu_refresh_repo import JjcKungfuRefreshRepo
 from src.services.jx3.tuilan_rate_limit import fixed_sleep, random_sleep
 from src.storage.mongo_repos.jjc_inspect_repo import JjcInspectRepo
-from src.storage.mongo_repos.jjc_ranking_stats_repo import JjcRankingStatsRepo
+from src.storage.mongo_repos.jjc_ranking_stats_repo import JjcRankingStatsRepo, EquipmentSnapshotError
+from src.services.jx3.jjc_ranking_equipment import equipment_view_statistics
 from src.storage.mongo_repos.jjc_sync_repo import JjcSyncRepo
 from src.services.jx3.match_detail_persistence import MatchDetailPersistenceService
 
@@ -38,6 +46,24 @@ CACHED_MATCH_DETAIL_WIN_KUNGFU_FIELDS = (
     "kungfu_selected_source",
     "kungfu_id",
 )
+
+_RANKING_KUNGFU_FIELDS = (
+    "kungfu_verified_at", "kungfu_source", "kungfu_freshness",
+    "kungfu_unknown_reason", "kungfu_publish_version", "kungfu_acquisition",
+    "display_identity_id", "display_locator", "display_scope",
+    "display_packet", "display_attempt", "self_kungfu_id",
+    "weapon_checked", "teammates_checked",
+)
+
+
+_EQUIPMENT_PUBLICATION_LOCKS = WeakKeyDictionary()
+
+
+def _equipment_publication_lock():
+    loop = asyncio.get_running_loop()
+    if loop not in _EQUIPMENT_PUBLICATION_LOCKS:
+        _EQUIPMENT_PUBLICATION_LOCKS[loop] = asyncio.Lock()
+    return _EQUIPMENT_PUBLICATION_LOCKS[loop]
 
 
 @dataclass(frozen=True)
@@ -66,6 +92,11 @@ class JjcRankingService:
     kungfu_refresh_repo: Any = None
     kungfu_query_service: Any = None
     kungfu_policy: Optional[Union[KungfuPolicy, Callable[[], KungfuPolicy]]] = None
+
+    equipment_service: Any = None
+
+    foreground_client: Any = None
+    query_context: Any = None
 
     def _ranking_kungfu_policy(self) -> KungfuPolicy:
         if self.kungfu_policy is not None:
@@ -150,7 +181,13 @@ class JjcRankingService:
                 "kungfu_publish_version": result.get("publish_version") if isinstance(result, dict) else None,
                 "kungfu_selected_source": result.get("source") if found else None,
                 "weapon_checked": False, "teammates_checked": False,
+                "kungfu_acquisition": "cache",
             }
+            if identity is not None:
+                # Freeze before registration yields: a later refresh must not
+                # redefine this snapshot's identity or publication baseline.
+                context = copy.deepcopy(display_context(identity, scope))
+                member.update({"display_" + key: value for key, value in context.items()})
             members.append(member)
         degraded = bool(ranking_data.get("refresh_degraded"))
         if (getattr(cfg, "JJC_KUNGFU_REFRESH_ENABLED", 0)
@@ -182,12 +219,23 @@ class JjcRankingService:
                 if (status["freshness"] == "unknown" or
                         canonical.get(saved["name"]) != saved["kungfu_id"]):
                     return member
+                packet = copy.deepcopy(saved.get("display_packet"))
+                attempt = copy.deepcopy(saved.get("display_attempt"))
                 return {**member, "found": True, "kungfu": saved["name"],
                         "kungfu_id": saved["kungfu_id"],
                         "kungfu_freshness": status["freshness"], "kungfu_unknown_reason": None,
                         "kungfu_verified_at": saved["verified_at"], "kungfu_source": saved["source"],
                         "kungfu_selected_source": saved["source"],
-                        "kungfu_publish_version": saved["publish_version"]}
+                        "kungfu_publish_version": saved["publish_version"],
+                        "kungfu_acquisition": "live", "display_packet": packet,
+                        "display_attempt": attempt,
+                        "self_kungfu_id": packet.get("self_kungfu_id") if packet else None,
+                        "weapon_checked": bool(packet and packet.get("weapon_ready")),
+                        "teammates_checked": bool(packet and packet.get("team_ready")),
+                        "weapon_name": packet.get("weapon_name") if packet else None,
+                        "weapon_icon": packet.get("weapon_icon") if packet else None,
+                        "weapon_quality": packet.get("weapon_quality") if packet else None,
+                        "teammates": copy.deepcopy(packet.get("teammates", [])) if packet else []}
             # No safe persistent identity: query using the ranking locator, but
             # never publish the answer onto a conflicting same-name identity.
             queried = await self.get_user_kungfu(member["server"], member["name"],
@@ -200,7 +248,7 @@ class JjcRankingService:
             return {**member, **queried, "kungfu_id": canonical[name],
                     "kungfu_freshness": "fresh", "kungfu_unknown_reason": None,
                     "kungfu_verified_at": time.time(), "kungfu_source": "direct_legacy",
-                    "kungfu_publish_version": None}
+                    "kungfu_publish_version": None, "kungfu_acquisition": "live"}
         except Exception as exc:
             logger.warning("排行榜缺失心法直接查询失败: rank={} exception_type={}", rank, type(exc).__name__)
             return member
@@ -212,12 +260,48 @@ class JjcRankingService:
             tuilan_request=self.tuilan_request,
         )
 
+    async def _foreground_sync_request(self, func, *args):
+        context = self.query_context
+        context.check()
+        def invoke():
+            # Executor queueing must not start new HTTP after the caller left.
+            context.check()
+            return func(*args)
+        owner = asyncio.create_task(asyncio.to_thread(invoke))
+        owners = context.recovery_physical_owners
+        owners.add(owner)
+        def finished(task):
+            owners.discard(task)
+            if not task.cancelled():
+                task.exception()
+        owner.add_done_callback(finished)
+        return await asyncio.shield(owner)
+
+    async def _foreground_request(self, endpoint, params):
+        context = self.query_context
+        context.check()
+        def retain(owner):
+            context.recovery_physical_owners.add(owner)
+            owner.add_done_callback(context.recovery_physical_owners.discard)
+        tracked_request = getattr(self.foreground_client, 'request_with_owner', None)
+        if callable(tracked_request):
+            return await tracked_request(endpoint, params, deadline=context.deadline, on_owner=retain)
+        return await self.foreground_client.request(endpoint, params, deadline=context.deadline)
+
     def _cache(self) -> JjcCacheRepo:
-        return JjcCacheRepo(
-            jjc_ranking_cache_duration=self.jjc_ranking_cache_duration,
-            kungfu_cache_duration=self.kungfu_cache_duration,
-            db=get_db(),
-        )
+        try:
+            repo = JjcCacheRepo(
+                jjc_ranking_cache_duration=self.jjc_ranking_cache_duration,
+                kungfu_cache_duration=self.kungfu_cache_duration,
+                db=get_db(),
+            )
+        except Exception:
+            if self.query_context is not None:
+                raise ForegroundMongoFailure("indicator_storage_unavailable") from None
+            raise
+        if self.query_context is not None and self.query_context.mongo is not None:
+            return self.query_context.mongo.bind_repo(repo)
+        return repo
 
     def _inspect_cache(self) -> JjcInspectRepo:
         return self.inspect_repo or JjcInspectRepo()
@@ -618,6 +702,19 @@ class JjcRankingService:
         return ",".join(reasons) if reasons else "unknown"
 
     async def query_jjc_ranking(self, tag: Optional[int] = None) -> dict[str, Any]:
+        """Read a board and preserve normal default-board refresh registration."""
+        result = await self.query_jjc_ranking_raw(tag=tag)
+        if tag is None and not result.get("error") and result.get("code") == 0:
+            return await self._prewarm_ranking_kungfus(result)
+        return result
+
+    @observed_query_stage("ranking")
+    async def query_jjc_ranking_raw(self, tag: Optional[int] = None) -> dict[str, Any]:
+        """Read only the board, without resolving or queueing its role identities.
+
+        Caller results, upstream responses and the saved raw board own separate
+        copies so request-specific metadata or edits cannot leak between them.
+        """
         logger.info("开始查询竞技场排行榜数据")
 
         explicit_tag = tag is not None
@@ -627,7 +724,7 @@ class JjcRankingService:
         if not explicit_tag:
             cached = await self._cache().load_ranking_cache()
             if cached:
-                return await self._prewarm_ranking_kungfus(cached)
+                return copy.deepcopy(cached)
 
         try:
             if explicit_tag:
@@ -635,7 +732,13 @@ class JjcRankingService:
                 logger.info("使用指定竞技场时间标签: tag={}", tag)
             else:
                 logger.info("获取竞技场时间标签")
-                time_tag_result = await asyncio.to_thread(self._api().get_arena_time_tag)
+                if self.query_context is not None and self.foreground_client is not None:
+                    self.query_context.check()
+                    time_tag_result = await self._foreground_request('arena_time_tag', {'type': 'role'})
+                elif self.query_context is not None:
+                    time_tag_result = await self._foreground_sync_request(self._api().get_arena_time_tag)
+                else:
+                    time_tag_result = await asyncio.to_thread(self._api().get_arena_time_tag)
 
                 if time_tag_result.get("error"):
                     logger.warning(f"获取竞技场时间标签失败: {time_tag_result}")
@@ -651,7 +754,13 @@ class JjcRankingService:
                         "message": f"获取时间标签失败: {time_tag_result.get('msg', '未知错误')}",
                     }
 
+                if self.query_context is not None:
+                    self.query_context.check()
+                    if self.query_context.remaining() <= 5.45:
+                        raise ForegroundQueryTimeout()
                 await fixed_sleep(5.45)
+                if self.query_context is not None:
+                    self.query_context.check()
 
                 data = time_tag_result.get("data", {})
                 default_week = int(data.get("defaultWeek") or 0)
@@ -665,7 +774,14 @@ class JjcRankingService:
 
                 logger.info(f"获取竞技场时间标签成功: defaultWeek={default_week} tag={tag}")
             logger.info("获取竞技场排行榜")
-            ranking_result = await asyncio.to_thread(self._api().get_arena_ranking, tag)
+            if self.query_context is not None and self.foreground_client is not None:
+                self.query_context.check()
+                ranking_result = await self._foreground_request('arena_ranking',
+                    {'typeName': 'week', 'heiMaBang': False, 'tag': tag})
+            elif self.query_context is not None:
+                ranking_result = await self._foreground_sync_request(self._api().get_arena_ranking, tag)
+            else:
+                ranking_result = await asyncio.to_thread(self._api().get_arena_ranking, tag)
 
             if ranking_result.get("error"):
                 return {"error": True, "message": f"获取竞技场排行榜失败: {ranking_result.get('error')}"}
@@ -676,17 +792,18 @@ class JjcRankingService:
                     "message": f"获取竞技场排行榜失败: {ranking_result.get('msg', '未知错误')}",
                 }
 
+            ranking_result = copy.deepcopy(ranking_result)
             if explicit_tag:
                 ranking_result["explicit_tag"] = True
             ranking_result["defaultWeek"] = default_week
             ranking_result["cache_time"] = time.time()
 
             if not explicit_tag:
-                await self._cache().save_ranking_cache(ranking_result)
+                await self._cache().save_ranking_cache(copy.deepcopy(ranking_result))
 
-            if not explicit_tag:
-                return await self._prewarm_ranking_kungfus(ranking_result)
             return ranking_result
+        except (ForegroundQueryError, ForegroundMongoFailure, asyncio.TimeoutError):
+            raise
         except Exception as exc:
             logger.exception(f"查询竞技场排行榜失败: {exc}")
             return {"error": True, "message": f"查询竞技场排行榜失败: {exc}"}
@@ -793,7 +910,8 @@ class JjcRankingService:
         week_info: str,
         payload: Optional[dict[str, Any]] = None,
     ) -> Optional[asyncio.Task]:
-        ranking_timestamp = int(ranking_result.get("cache_time") or time.time())
+        equipment_view = (payload or {}).get("equipment_view")
+        ranking_timestamp = int(equipment_view["timestamp"] if equipment_view else ranking_result.get("cache_time") or time.time())
         try:
             stats_payload = {
                 "generated_at": time.time(),
@@ -802,10 +920,18 @@ class JjcRankingService:
                 "current_season": self.current_season,
                 "week_info": week_info,
                 "kungfu_statistics": stats,
+                "ranking_display_kind": "historical" if ranking_result.get("explicit_tag") is True else "current",
             }
             for key in ("kungfu_cache_scope", "refresh_degraded"):
                 if payload is not None and key in payload:
                     stats_payload[key] = copy.deepcopy(payload[key])
+            if equipment_view is not None:
+                if ranking_result.get("explicit_tag") is True:
+                    raise EquipmentSnapshotError("historical")
+                stats_payload.update(schema_version=2, equipment_source="local_win_v2", equipment_complete=True,
+                    equipment_view=copy.deepcopy(equipment_view), member_revision=equipment_view["member_revision"],
+                    equipment_view_revision=equipment_view["equipment_view_revision"],
+                    kungfu_cache_scope=copy.deepcopy(equipment_view["scope"]))
             summary_payload = self._build_summary_payload(stats_payload)
             detail_payloads = self._build_detail_payloads(stats)
             mongo_task = self._save_ranking_stats_to_mongo(
@@ -813,12 +939,15 @@ class JjcRankingService:
                 summary_payload=summary_payload,
                 detail_payloads=detail_payloads,
                 sync_request=(payload or {}).get("_sync_request"),
+                equipment_expected=(payload or {}).get("_equipment_expected"),
             )
 
             logger.info("保存竞技场统计到 Mongo: timestamp={} details={}", ranking_timestamp, len(detail_payloads))
             return mongo_task
         except Exception as exc:
             logger.warning("保存竞技场统计结果失败: {}", exc)
+            if equipment_view is not None:
+                raise
             return None
 
     def _build_summary_payload(self, stats_payload: dict[str, Any]) -> dict[str, Any]:
@@ -846,6 +975,9 @@ class JjcRankingService:
                     summary_range[lane_name] = lane
                     continue
 
+                if range_stats.get("equipment_source") == "local_win_v2":
+                    summary_range[lane_name] = {key: copy.deepcopy(value) for key, value in lane.items() if key != "members"}
+                    continue
                 members_map = lane.get("members") or {}
                 legendary_count_map: dict[str, int] = {}
                 for kungfu, members in members_map.items():
@@ -905,16 +1037,23 @@ class JjcRankingService:
         summary_payload: Dict[str, Any],
         detail_payloads: List[Dict[str, Any]],
         sync_request: Optional[Dict[str, Any]] = None,
+        equipment_expected: Optional[Dict[str, Any]] = None,
     ) -> Optional[asyncio.Task]:
         sync_request = sync_request or self._new_sync_request()
         async def _save() -> None:
             try:
-                await JjcRankingStatsRepo().save_snapshot(
-                    timestamp=timestamp,
-                    summary_payload=summary_payload,
-                    detail_payloads=detail_payloads,
-                    source="ranking_job",
-                )
+                repo = JjcRankingStatsRepo()
+                async with _equipment_publication_lock():
+                    if summary_payload.get("equipment_source") == "local_win_v2":
+                        latest = await repo.get_latest_current_summary(summary_payload["kungfu_cache_scope"])
+                        if latest and latest.get("timestamp", 0) > timestamp:
+                            raise EquipmentSnapshotError("historical")
+                        expected = equipment_expected or {}
+                        await repo.publish_equipment_snapshot(timestamp, summary_payload,
+                            expected_revision=expected.get("expected_revision"), expected_legacy=expected.get("expected_legacy"))
+                    else:
+                        await repo.save_snapshot(timestamp=timestamp, summary_payload=summary_payload,
+                            detail_payloads=detail_payloads, source="ranking_job")
                 await self._enqueue_ranking_members_for_sync(
                     detail_payloads=detail_payloads,
                     timestamp=timestamp,
@@ -922,6 +1061,8 @@ class JjcRankingService:
                 )
             except Exception as exc:
                 logger.warning("保存竞技场统计到 Mongo 失败: timestamp={} error={}", timestamp, exc)
+                if summary_payload.get("equipment_source") == "local_win_v2" or isinstance(exc, EquipmentSnapshotError):
+                    raise
 
         try:
             loop = asyncio.get_running_loop()
@@ -1353,7 +1494,7 @@ class JjcRankingService:
                     "teammates": kungfu_info.get("teammates"),
                     "weapon_icon": kungfu_info.get("weapon_icon"),
                     "weapon_quality": kungfu_info.get("weapon_quality"),
-                    "weapon_name": extract_weapon_name(kungfu_info.get("weapon")),
+                    "weapon_name": extract_weapon_name(kungfu_info.get("weapon")) or kungfu_info.get("weapon_name"),
                     "weapon_checked": kungfu_info.get("weapon_checked"),
                     "teammates_checked": kungfu_info.get("teammates_checked"),
                     "match_history_checked": kungfu_info.get("match_history_checked"),
@@ -1367,9 +1508,8 @@ class JjcRankingService:
                     "cached_match_detail_win_samples": kungfu_info.get("cached_match_detail_win_samples"),
                 }
                 if use_local:
-                    for field in ("kungfu_verified_at", "kungfu_source", "kungfu_freshness",
-                                  "kungfu_unknown_reason", "kungfu_publish_version"):
-                        ranking_member[field] = kungfu_info.get(field)
+                    for field in _RANKING_KUNGFU_FIELDS:
+                        ranking_member[field] = copy.deepcopy(kungfu_info.get(field))
                 kungfu_results.append(ranking_member)
                 if self._should_enqueue_ranking_member_immediately(
                     member=ranking_member,
@@ -1455,11 +1595,8 @@ class JjcRankingService:
                                     "weapon_icon": player_item.get("weapon_icon"),
                                     "weapon_quality": player_item.get("weapon_quality"),
                                     "weapon_name": player_item.get("weapon_name"),
-                                    **({field: player_item.get(field) for field in (
-                                        "kungfu_verified_at", "kungfu_source", "kungfu_freshness",
-                                        "kungfu_unknown_reason", "kungfu_publish_version",
-                                        "weapon_checked", "teammates_checked",
-                                    )} if use_local else {}),
+                                    **({field: copy.deepcopy(player_item.get(field)) for field in
+                                        _RANKING_KUNGFU_FIELDS} if use_local else {}),
                                 }
                             )
                         elif kungfu in dps_kungfu:
@@ -1483,11 +1620,8 @@ class JjcRankingService:
                                     "weapon_icon": player_item.get("weapon_icon"),
                                     "weapon_quality": player_item.get("weapon_quality"),
                                     "weapon_name": player_item.get("weapon_name"),
-                                    **({field: player_item.get(field) for field in (
-                                        "kungfu_verified_at", "kungfu_source", "kungfu_freshness",
-                                        "kungfu_unknown_reason", "kungfu_publish_version",
-                                        "weapon_checked", "teammates_checked",
-                                    )} if use_local else {}),
+                                    **({field: copy.deepcopy(player_item.get(field)) for field in
+                                        _RANKING_KUNGFU_FIELDS} if use_local else {}),
                                 }
                             )
                         else:
@@ -1583,12 +1717,36 @@ class JjcRankingService:
             kungfu_stats["top_100"] = count_kungfu_by_rank(kungfu_results, 100)
             kungfu_stats["top_50"] = count_kungfu_by_rank(kungfu_results, 50)
 
+            equipment_view = None
+            equipment_expected = None
+            if getattr(cfg, "JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED", 0) == 1 and not historical:
+                if self.equipment_service is None:
+                    raise RuntimeError("equipment_service_unavailable")
+                frozen = copy.deepcopy(kungfu_results)
+                for member in frozen:
+                    member["lane"] = ("healer" if member.get("kungfu") in self.kungfu_healer_list else
+                                      "dps" if member.get("kungfu") in self.kungfu_dps_list else "unknown")
+                equipment_view = await self.equipment_service.build_frozen_view(
+                    timestamp=int(ranking_data.get("cache_time") or time.time()), members=frozen)
+                equipment_expected = equipment_view.pop("_publication_expected", None)
+                previous_stats = kungfu_stats
+                kungfu_stats = equipment_view_statistics(equipment_view)
+                for range_key, previous in previous_stats.items():
+                    for field in ("kungfu_cache",):
+                        if field in previous:
+                            kungfu_stats[range_key][field] = copy.deepcopy(previous[field])
+
             result: dict[str, Any] = {
                 "_sync_request": sync_request,
                 "kungfu_statistics": kungfu_stats,
                 "ranking_kungfu_lines": ranking_kungfu_lines,
                 "missing_kungfu_lines": missing_kungfu_lines,
+                "ranking_display_kind": "historical" if historical else "current",
             }
+
+            if equipment_view is not None:
+                result["equipment_view"] = equipment_view
+                result["_equipment_expected"] = equipment_expected
 
             if "refresh_degraded" in ranking_data:
                 result["refresh_degraded"] = bool(ranking_data["refresh_degraded"])

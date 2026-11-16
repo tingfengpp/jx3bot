@@ -203,3 +203,166 @@ class RoleIdentityKungfuTests(unittest.IsolatedAsyncioTestCase):
         identity_cas = _snapshot_filter(self.before)
         self.assertTrue(await self.publish())
         self.assertTrue(matches(self.collection.doc, identity_cas))
+
+
+def display_publication_fixture(identity, scope, generation, state="full"):
+    """Independent valid publication input, so repo RED does not depend on builder RED."""
+    locator = {key: identity[key] for key in
+               ("server", "name", "zone", "game_role_id", "role_id", "global_id", "global_role_id")
+               if key in identity}
+    metadata = {"publish_version": generation, "scope": copy.deepcopy(scope),
+                "identity_id": str(identity["_id"]), "locator": locator,
+                "requested_at": 1900.0 + generation, "verified_at": 1901.0 + generation}
+    attempt = dict(copy.deepcopy(metadata), state=state, missing_reasons={}, error_code=None)
+    update = {"attempt": attempt}
+    if state in ("full", "partial"):
+        packet = dict(copy.deepcopy(metadata), match_id=700 + generation, match_time=1800,
+                      self_kungfu_id=10021, team_ready=state == "full", weapon_ready=True,
+                      weapon_name="weapon-%s" % generation, weapon_quality=5,
+                      weapon_icon="https://example.invalid/weapon.png",
+                      teammates=[{"role_id": "43", "kungfu_id": 10081},
+                                 {"role_id": "44", "kungfu_id": 10080}] if state == "full" else [])
+        update["current"] = packet
+        if state == "full":
+            update["last_complete"] = copy.deepcopy(packet)
+        else:
+            attempt.update(missing_reasons={"team": "team_unresolved"}, error_code="team_unresolved")
+    elif state == "failed":
+        attempt.update(missing_reasons={"team": "request_timeout", "weapon": "request_timeout"},
+                       error_code="request_timeout")
+    elif state == "no_win":
+        update["no_win_version"] = generation
+        update["no_win_context"] = {key: copy.deepcopy(metadata[key])
+                                    for key in ("scope", "identity_id", "locator")}
+    else:
+        raise ValueError("unknown fixture state")
+    return update
+
+
+class DisplayResultCollection(ResultCollection):
+    async def update(self, query, update, *args, **kwargs):
+        if self.doc is None or not matches(self.doc, query):
+            return SimpleNamespace(matched_count=0, modified_count=0)
+        allowed = {"jjc_kungfu", "jjc_display.current", "jjc_display.last_complete",
+                   "jjc_display.attempt", "jjc_display.no_win_version", "jjc_display.no_win_context"}
+        if set(update) != {"$set"} or not set(update["$set"]).issubset(allowed):
+            raise AssertionError("display publication must use only narrow allowed $set paths")
+        for path, value in update["$set"].items():
+            target = self.doc
+            parts = path.split(".")
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})
+            target[parts[-1]] = copy.deepcopy(value)
+        return SimpleNamespace(matched_count=1, modified_count=1)
+
+
+class RoleIdentityDisplayPublicationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.identity = {"_id": ObjectId(), "name": "role-a", "server": "server-a", "zone": "zone-a",
+                         "game_role_id": "42", "global_id": None, "updated_at": 100,
+                         "last_seen_at": 101, "profile_observed_at": 99,
+                         "role_info_observed_match_time": 98,
+                         "jjc_display": {"unrelated_marker": "preserve"}}
+        self.scope = {"season_id": "season-a", "season_start": 1000,
+                      "pvp_type": 3, "algorithm_version": 1}
+        self.locator = {key: self.identity[key] for key in
+                        ("name", "server", "zone", "game_role_id", "global_id")}
+        self.collection = DisplayResultCollection(self.identity)
+        self.history = SimpleNamespace(insert_one=AsyncMock())
+        self.repo = RoleIdentityRepo(db=SimpleNamespace(role_identities=self.collection,
+                                                       role_identities_history=self.history))
+
+    def result(self, generation):
+        return dict(self.scope, publish_version=generation, name="冰心诀", kungfu_id=10081,
+                    requested_at=1900.0 + generation, verified_at=1901.0 + generation)
+
+    async def publish(self, generation, update):
+        return await self.repo.publish_jjc_kungfu_if_newer(
+            self.identity["_id"], self.locator, generation, self.result(generation), display_update=update)
+
+    async def test_full_partial_failure_no_win_failure_full_preserves_bounded_packets(self):
+        expected_display = copy.deepcopy(self.identity["jjc_display"])
+        expected_paths = {"jjc_kungfu"}
+        for generation, state in enumerate(("full", "partial", "failed", "no_win", "failed", "full"), 1):
+            with self.subTest(generation=generation, state=state):
+                update = display_publication_fixture(self.identity, self.scope, generation, state)
+                self.assertTrue(await self.publish(generation, update))
+                expected_display.update(copy.deepcopy(update))
+                self.assertEqual(self.collection.doc.get("jjc_display"), expected_display)
+                self.assertEqual(self.collection.doc["jjc_kungfu"], self.result(generation))
+                query, mutation = self.collection.update_one.call_args.args[:2]
+                self.assertEqual(set(mutation["$set"]), expected_paths | {"jjc_display." + key for key in update})
+                self.assertNotIn("updated_at", query)
+                self.assertFalse(self.collection.update_one.call_args.kwargs.get("upsert", False))
+        for key in self.identity:
+            if key != "jjc_display":
+                self.assertEqual(self.collection.doc[key], self.identity[key])
+        self.collection.find_one.assert_not_awaited()
+        self.history.insert_one.assert_not_awaited()
+
+    async def test_legacy_none_keeps_existing_display_and_exact_old_mutation(self):
+        before = copy.deepcopy(self.collection.doc["jjc_display"])
+        self.assertTrue(await self.publish(1, None))
+        self.assertEqual(self.collection.doc["jjc_display"], before)
+        self.assertEqual(self.collection.update_one.call_args.args[1], {"$set": {"jjc_kungfu": self.result(1)}})
+
+    async def test_partial_packet_reasons_survive_later_failed_attempt(self):
+        from src.services.jx3.jjc_ranking_display import build_display_update
+        from tests.test_jjc_ranking_display import source_evidence
+        evidence = source_evidence()
+        evidence["requested_at"] = self.result(1)["requested_at"]
+        evidence["display_evidence"]["match_time"] = 1800
+        evidence["display_evidence"]["detail_data"]["team1"]["players_info"][0]["armors"] = []
+        partial = build_display_update(self.identity, self.scope, 1, evidence, self.result(1)["verified_at"])
+        self.assertTrue(await self.publish(1, partial))
+        packet = copy.deepcopy(self.collection.doc["jjc_display"]["current"])
+        self.assertEqual(packet.get("missing_reasons"), {"weapon": "weapon_incomplete"})
+        self.assertTrue(await self.publish(2, display_publication_fixture(self.identity, self.scope, 2, "failed")))
+        self.assertEqual(self.collection.doc["jjc_display"]["current"], packet)
+        self.assertEqual(self.collection.doc["jjc_display"]["attempt"]["error_code"], "request_timeout")
+
+    async def test_first_partial_publishes_without_inventing_a_complete_packet(self):
+        update = display_publication_fixture(self.identity, self.scope, 1, "partial")
+        self.assertTrue(await self.publish(1, update))
+        self.assertEqual(self.collection.doc.get("jjc_display", {}).get("current"), update["current"])
+        self.assertNotIn("last_complete", self.collection.doc["jjc_display"])
+        self.assertNotIn("no_win_version", self.collection.doc["jjc_display"])
+
+    async def test_invalid_display_binding_and_unapproved_fields_never_reach_database(self):
+        base = display_publication_fixture(self.identity, self.scope, 1)
+        mutations = []
+        for key, value in (("publish_version", 2), ("publish_version", True),
+                           ("identity_id", str(ObjectId())), ("scope", dict(self.scope, season_id="other")),
+                           ("locator", dict(self.locator, global_id="changed")),
+                           ("verified_at", float("nan")), ("requested_at", 9999)):
+            for child in ("attempt", "current", "last_complete"):
+                update = copy.deepcopy(base)
+                update[child][key] = value
+                mutations.append((child + "." + key, update))
+        injected = copy.deepcopy(base)
+        injected["updated_at"] = 999
+        mutations.append(("unapproved root key", injected))
+        inconsistent = copy.deepcopy(base)
+        inconsistent["attempt"]["state"] = "failed"
+        mutations.append(("failed with new packet", inconsistent))
+        for label, update in mutations:
+            with self.subTest(label=label):
+                self.collection.update_one.reset_mock()
+                try:
+                    accepted = await self.publish(1, update)
+                except ValueError:
+                    accepted = False
+                self.assertFalse(accepted, "invalid publication metadata must not be accepted")
+                self.collection.update_one.assert_not_awaited()
+
+    async def test_old_version_or_changed_locator_cannot_publish_any_display_subfield(self):
+        newer = display_publication_fixture(self.identity, self.scope, 2)
+        self.assertTrue(await self.publish(2, newer))
+        self.assertEqual(self.collection.doc.get("jjc_display", {}).get("attempt"), newer["attempt"])
+        before = copy.deepcopy(self.collection.doc)
+        self.assertFalse(await self.publish(1, display_publication_fixture(self.identity, self.scope, 1)))
+        self.assertEqual(self.collection.doc, before)
+        self.collection.doc["global_id"] = "changed"
+        before = copy.deepcopy(self.collection.doc)
+        self.assertFalse(await self.publish(3, display_publication_fixture(self.identity, self.scope, 3)))
+        self.assertEqual(self.collection.doc, before)

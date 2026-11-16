@@ -1993,6 +1993,21 @@ class JjcMatchDataSyncService:
             )
         if not isinstance(identity, dict) or identity.get("error"):
             return {}
+        if "identity" in identity:
+            # Inspect's observation/request metadata stays inside its resolution
+            # packet. Sync continues to consume only identity facts and source.
+            resolution = identity
+            identity = resolution.get("identity")
+            if is_tuilan_auth_error(identity):
+                raise JjcSyncGlobalPauseError(
+                    build_tuilan_auth_pause_reason(identity, context="角色身份补全")
+                )
+            if not isinstance(identity, dict) or identity.get("error"):
+                return {}
+            identity = dict(identity)
+            source = str(resolution.get("identity_source") or "").strip()
+            if source and not identity.get("source"):
+                identity["source"] = source
         return identity
 
     async def _resolve_player_identity_from_local_repo(self, player: Dict[str, Any]) -> Dict[str, Any]:

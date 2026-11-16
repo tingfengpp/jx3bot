@@ -6,6 +6,9 @@ from typing import Any, Dict, Optional
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from nonebot import logger
+from src.utils.jjc_query_observability import foreground_safe_logger
+
+logger = foreground_safe_logger(logger, component="profile_repo")
 
 from src.infra.mongo import get_db as _get_db
 

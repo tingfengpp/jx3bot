@@ -60,6 +60,11 @@ def set_bot_initialized(value: bool) -> None:
 
 async def notify_jjc_ranking_failure(bot, detail: str) -> None:
     message = f"竞技排名定时任务统计失败：{detail}"
+    if bot is None:
+        bot = next(iter(get_driver().bots.values()), None)
+    if bot is None:
+        logger.warning("status_monitor QQ 未连接，无法私聊管理员: {}", message)
+        return
     for admin_qq in getattr(cfg, "ADMIN_QQ", []):
         try:
             await bot.send_private_msg(user_id=int(admin_qq), message=message)
@@ -647,8 +652,6 @@ async def push_daily_gte():
 
 @scheduler.scheduled_job("cron", hour=9, minute=0, max_instances=1)
 async def push_daily_jjc_peak_score_ranking():
-    if not BOT_INITIALIZED:
-        return
     try:
         result = await jjc_peak_score_ranking_service.run_latest_two_snapshots()
         logger.info(
@@ -665,129 +668,132 @@ async def push_daily_jjc_peak_score_ranking():
 
 @scheduler.scheduled_job("cron", hour="3,21", minute=0, max_instances=2)
 async def push_daily_jjc_ranking():
-    if BOT_INITIALIZED:
-        try:
-            bots = get_driver().bots
-            if not bots:
-                logger.warning("status_monitor 没有可用的机器人")
-                return
+    bot = None
+    try:
+        ranking_result = await jjc_ranking_service.query_jjc_ranking()
+        if not ranking_result:
+            logger.warning("status_monitor 获取竞技场排行榜数据失败：返回为空")
+            await notify_jjc_ranking_failure(bot, "获取竞技场排行榜数据失败：返回为空")
+            return
 
-            bot = list(bots.values())[0]
-            groups_config = await group_config_repo.load()
+        if ranking_result.get("error"):
+            detail = ranking_result.get("message", "未知错误")
+            logger.warning(
+                "status_monitor 获取竞技场排行榜数据失败：{}",
+                detail,
+            )
+            await notify_jjc_ranking_failure(bot, f"获取竞技场排行榜数据失败：{detail}")
+            return
 
-            target_groups = [
-                gid
-                for gid, config in groups_config.items()
-                if isinstance(config, dict) and config.get("竞技排名推送", False)
-            ]
+        if ranking_result.get("code") != 0:
+            detail = ranking_result.get("code")
+            logger.warning(
+                "status_monitor 获取竞技场排行榜数据失败：API返回错误码 {}",
+                detail,
+            )
+            await notify_jjc_ranking_failure(bot, f"获取竞技场排行榜数据失败：API返回错误码 {detail}")
+            return
 
-            if not target_groups:
-                logger.info("status_monitor 没有开启竞技排名推送的群组")
-                return
+        default_week = ranking_result.get("defaultWeek")
+        cache_time = ranking_result.get("cache_time")
+        week_info = (
+            jjc_ranking_service.calculate_season_week_info(default_week, cache_time)
+            if default_week
+            else "第12周"
+        )
 
-            ranking_result = await jjc_ranking_service.query_jjc_ranking()
-            if not ranking_result:
-                logger.warning("status_monitor 获取竞技场排行榜数据失败：返回为空")
-                await notify_jjc_ranking_failure(bot, "获取竞技场排行榜数据失败：返回为空")
-                return
+        ranking_data = await jjc_ranking_service.get_ranking_kungfu_data(ranking_data=ranking_result)
+        if not ranking_data:
+            logger.warning("status_monitor 获取心法统计数据失败：返回为空")
+            await notify_jjc_ranking_failure(bot, "获取心法统计数据失败：返回为空")
+            return
 
-            if ranking_result.get("error"):
-                detail = ranking_result.get("message", "未知错误")
-                logger.warning(
-                    "status_monitor 获取竞技场排行榜数据失败：{}",
-                    detail,
+        if ranking_data.get("error"):
+            detail = ranking_data.get("message", "未知错误")
+            logger.warning(
+                "status_monitor 获取心法统计数据失败：{}",
+                detail,
+            )
+            await notify_jjc_ranking_failure(bot, f"获取心法统计数据失败：{detail}")
+            return
+
+        stats = ranking_data.get("kungfu_statistics", {})
+        if not stats:
+            logger.warning("status_monitor 心法统计数据为空")
+            await notify_jjc_ranking_failure(bot, "心法统计数据为空")
+            return
+
+        # 统计落库不依赖 QQ、群订阅或图片渲染。
+        save_task = jjc_ranking_service.save_ranking_stats(
+            ranking_result=ranking_result,
+            stats=stats,
+            week_info=week_info,
+            **({"payload": ranking_data} if any(key in ranking_data for key in ("kungfu_cache_scope", "refresh_degraded", "_sync_request", "equipment_view")) else {}),
+        )
+        if ranking_data.get("equipment_view") is not None and save_task is None:
+            raise RuntimeError("equipment_publication_unavailable")
+        if save_task is not None:
+            await save_task
+
+        # 采集可能耗时较长，发送前重新获取连接状态。
+        bot = next(iter(get_driver().bots.values()), None)
+        if bot is None:
+            logger.info("status_monitor 竞技排名统计流程完成，QQ 未连接，跳过群推送")
+            return
+
+        groups_config = await group_config_repo.load()
+        target_groups = [
+            gid
+            for gid, config in groups_config.items()
+            if isinstance(config, dict) and config.get("竞技排名推送", False)
+        ]
+        if not target_groups:
+            logger.info("status_monitor 竞技排名统计流程完成，没有开启竞技排名推送的群组")
+            return
+
+        payload = await render_combined_ranking_image(
+            env=env,
+            render_template_image=render_template_image,
+            current_season=cfg.CURRENT_SEASON,
+            stats=stats,
+            week_info=week_info,
+            show_legendary=False,
+        )
+        if not payload:
+            logger.warning("status_monitor 渲染竞技场统计图失败")
+            await notify_jjc_ranking_failure(bot, "渲染竞技场统计图失败")
+            return
+
+        summary_text = (
+            f"⏰ 每日03:00/21:00竞技排名推送（{week_info}）\n"
+            f"统计范围：{payload['scope_desc']}\n"
+            f"统计完成！共处理 {payload['total_valid_data']} 条有效数据（{payload['processed_label']}）"
+        )
+        missing_kungfu_lines = ranking_data.get("missing_kungfu_lines", [])
+
+        for gid in target_groups:
+            try:
+                await bot.send_group_msg(
+                    group_id=int(gid), message=MessageSegment.image(payload["image_bytes"])
                 )
-                await notify_jjc_ranking_failure(bot, f"获取竞技场排行榜数据失败：{detail}")
-                return
+                await bot.send_group_msg(group_id=int(gid), message=summary_text)
+                if missing_kungfu_lines:
+                    chunk_size = 100
+                    total_lines = len(missing_kungfu_lines)
+                    for start in range(0, total_lines, chunk_size):
+                        end = min(start + chunk_size, total_lines)
+                        chunk_header = f"未查询到心法的角色（共{total_lines}人，第{start + 1}-{end}名）"
+                        chunk_message = "\n".join(missing_kungfu_lines[start:end])
+                        await bot.send_group_msg(
+                            group_id=int(gid),
+                            message=f"{chunk_header}\n{chunk_message}",
+                        )
+                        await asyncio.sleep(0.5)
+                logger.info("status_monitor 向群{}推送每日竞技排名统计", gid)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("status_monitor 向群{}推送竞技排名统计失败: {}", gid, e)
 
-            if ranking_result.get("code") != 0:
-                detail = ranking_result.get("code")
-                logger.warning(
-                    "status_monitor 获取竞技场排行榜数据失败：API返回错误码 {}",
-                    detail,
-                )
-                await notify_jjc_ranking_failure(bot, f"获取竞技场排行榜数据失败：API返回错误码 {detail}")
-                return
-
-            default_week = ranking_result.get("defaultWeek")
-            cache_time = ranking_result.get("cache_time")
-            week_info = (
-                jjc_ranking_service.calculate_season_week_info(default_week, cache_time)
-                if default_week
-                else "第12周"
-            )
-
-            ranking_data = await jjc_ranking_service.get_ranking_kungfu_data(ranking_data=ranking_result)
-            if not ranking_data:
-                logger.warning("status_monitor 获取心法统计数据失败：返回为空")
-                await notify_jjc_ranking_failure(bot, "获取心法统计数据失败：返回为空")
-                return
-
-            if ranking_data.get("error"):
-                detail = ranking_data.get("message", "未知错误")
-                logger.warning(
-                    "status_monitor 获取心法统计数据失败：{}",
-                    detail,
-                )
-                await notify_jjc_ranking_failure(bot, f"获取心法统计数据失败：{detail}")
-                return
-
-            stats = ranking_data.get("kungfu_statistics", {})
-            if not stats:
-                logger.warning("status_monitor 心法统计数据为空")
-                await notify_jjc_ranking_failure(bot, "心法统计数据为空")
-                return
-
-            payload = await render_combined_ranking_image(
-                env=env,
-                render_template_image=render_template_image,
-                current_season=cfg.CURRENT_SEASON,
-                stats=stats,
-                week_info=week_info,
-                show_legendary=False,
-            )
-            if not payload:
-                logger.warning("status_monitor 渲染竞技场统计图失败")
-                await notify_jjc_ranking_failure(bot, "渲染竞技场统计图失败")
-                return
-
-            jjc_ranking_service.save_ranking_stats(
-                ranking_result=ranking_result,
-                stats=stats,
-                week_info=week_info,
-                payload=ranking_data if any(key in ranking_data for key in ("kungfu_cache_scope", "refresh_degraded", "_sync_request")) else payload,
-            )
-
-            summary_text = (
-                f"⏰ 每日03:00/21:00竞技排名推送（{week_info}）\n"
-                f"统计范围：{payload['scope_desc']}\n"
-                f"统计完成！共处理 {payload['total_valid_data']} 条有效数据（{payload['processed_label']}）"
-            )
-            missing_kungfu_lines = ranking_data.get("missing_kungfu_lines", [])
-
-            for gid in target_groups:
-                try:
-                    await bot.send_group_msg(
-                        group_id=int(gid), message=MessageSegment.image(payload["image_bytes"])
-                    )
-                    await bot.send_group_msg(group_id=int(gid), message=summary_text)
-                    if missing_kungfu_lines:
-                        chunk_size = 100
-                        total_lines = len(missing_kungfu_lines)
-                        for start in range(0, total_lines, chunk_size):
-                            end = min(start + chunk_size, total_lines)
-                            chunk_header = f"未查询到心法的角色（共{total_lines}人，第{start + 1}-{end}名）"
-                            chunk_message = "\n".join(missing_kungfu_lines[start:end])
-                            await bot.send_group_msg(
-                                group_id=int(gid),
-                                message=f"{chunk_header}\n{chunk_message}",
-                            )
-                            await asyncio.sleep(0.5)
-                    logger.info("status_monitor 向群{}推送每日竞技排名统计", gid)
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.warning("status_monitor 向群{}推送竞技排名统计失败: {}", gid, e)
-
-        except Exception as e:
-            logger.warning("status_monitor 每日竞技排名推送任务出错: {}", e)
-            await notify_jjc_ranking_failure(bot, f"每日竞技排名推送任务出错：{e}")
+    except Exception as e:
+        logger.warning("status_monitor 每日竞技排名推送任务出错: {}", e)
+        await notify_jjc_ranking_failure(bot, f"每日竞技排名推送任务出错：{e}")

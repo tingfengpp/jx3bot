@@ -1,6 +1,7 @@
 """Real Mongo tests: explicit isolated loopback URI, random disposable database."""
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timezone
 import os
 import multiprocessing
 import unittest
@@ -16,6 +17,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from src.storage.mongo_repos.jjc_kungfu_refresh_repo import JjcKungfuRefreshRepo, QueueIntegrityError
 from src.storage.mongo_repos.role_identity_repo import RoleIdentityRepo
 from tests.test_jjc_kungfu_refresh_repo import SCOPE
+from tests.test_role_identity_jjc_kungfu import display_publication_fixture
 
 
 def checked_test_uri(uri):
@@ -46,6 +48,135 @@ class TestMongoUriSafety(unittest.TestCase):
         for uri in ["mongodb://production.invalid:27029/", "mongodb://localhost:27017/", "mongodb://localhost:27029/production", "mongodb://localhost:27029/?replicaSet=anything", "mongodb://%s:%s@localhost:27029/" % (uuid4().hex, uuid4().hex)]:
             with self.subTest(uri=uri), self.assertRaises(ValueError):
                 checked_test_uri(uri)
+
+
+@unittest.skipUnless(os.environ.get("JJC_TEST_MONGO_URI"), "explicit local Mongo URI required")
+class TestDisplayPublicationMongo(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.uri = checked_test_uri(os.environ["JJC_TEST_MONGO_URI"])
+        self.db_name = "jjc_kungfu_test_" + uuid4().hex
+        self.client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=3000)
+        await self.client.admin.command("ping")
+        self.db = self.client[self.db_name]
+        self.roles = RoleIdentityRepo(db=self.db)
+        self.identity = {"_id": ObjectId(), "name": "role-a", "server": "server-a", "zone": "zone-a",
+                         "game_role_id": "42", "global_id": None,
+                         "updated_at": 123, "last_seen_at": 122, "profile_observed_at": 121,
+                         "role_info_observed_match_time": 120}
+        self.scope = {"season_id": "season-a", "season_start": 1000,
+                      "pvp_type": 3, "algorithm_version": 1}
+        self.locator = {key: self.identity[key] for key in
+                        ("name", "server", "zone", "game_role_id", "global_id")}
+        await self.db.role_identities.insert_one(deepcopy(self.identity))
+
+    async def asyncTearDown(self):
+        checked_test_uri(self.uri)
+        self.assertTrue(self.db_name.startswith("jjc_kungfu_test_"))
+        self.assertEqual(len(self.db_name), len("jjc_kungfu_test_") + 32)
+        await self.client.drop_database(self.db_name)
+        self.client.close()
+
+    def result(self, generation):
+        return dict(self.scope, publish_version=generation, name="冰心诀", kungfu_id=10081,
+                    requested_at=1900.0 + generation, verified_at=1901.0 + generation)
+
+    async def publish(self, generation, state="full", repo=None):
+        return await (repo or self.roles).publish_jjc_kungfu_if_newer(
+            self.identity["_id"], self.locator, generation, self.result(generation),
+            display_update=display_publication_fixture(self.identity, self.scope, generation, state))
+
+    async def test_full_partial_failure_no_win_failure_full_is_one_bounded_document(self):
+        expected = {}
+        for generation, state in enumerate(("full", "partial", "failed", "no_win", "failed", "full"), 1):
+            with self.subTest(generation=generation, state=state):
+                expected.update(display_publication_fixture(self.identity, self.scope, generation, state))
+                self.assertTrue(await self.publish(generation, state))
+                row = await self.db.role_identities.find_one({"_id": self.identity["_id"]})
+                self.assertEqual(row.get("jjc_display"), expected)
+                self.assertEqual(row["jjc_kungfu"], self.result(generation))
+        for key, value in self.identity.items():
+            self.assertEqual(row[key], value)
+        self.assertEqual(await self.db.role_identities_history.count_documents({}), 0)
+        self.assertEqual(await self.db.jjc_sync_identity_queue.count_documents({}), 0)
+
+    async def test_independent_clients_reject_old_display_after_new_success(self):
+        other_client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=3000)
+        try:
+            other = RoleIdentityRepo(db=other_client[self.db_name])
+            outcomes = await asyncio.gather(self.publish(1), self.publish(2, repo=other))
+            self.assertTrue(outcomes[1])
+            self.assertFalse(await self.publish(1))
+            row = await self.db.role_identities.find_one({"_id": self.identity["_id"]})
+            self.assertEqual(row["jjc_kungfu"]["publish_version"], 2)
+            self.assertEqual(row.get("jjc_display"), display_publication_fixture(self.identity, self.scope, 2))
+        finally:
+            other_client.close()
+
+    async def test_reader_never_observes_new_kungfu_without_same_attempt_and_full_packet(self):
+        other_client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=3000)
+        try:
+            observed = []
+            finished = asyncio.Event()
+            async def write():
+                try:
+                    for generation in range(1, 21):
+                        self.assertTrue(await self.publish(generation))
+                finally:
+                    finished.set()
+            async def read():
+                for _ in range(200):
+                    row = await other_client[self.db_name].role_identities.find_one({"_id": self.identity["_id"]})
+                    if "jjc_kungfu" in row:
+                        display = row.get("jjc_display", {})
+                        observed.append((row["jjc_kungfu"]["publish_version"],
+                            display.get("attempt", {}).get("publish_version"),
+                            display.get("current", {}).get("publish_version")))
+                    if finished.is_set():
+                        break
+            await asyncio.gather(write(), read())
+            self.assertTrue(observed)
+            self.assertTrue(all(kungfu == attempt == packet for kungfu, attempt, packet in observed),
+                            "a reader saw a mixed-generation role publication")
+        finally:
+            other_client.close()
+
+    async def test_scalar_int64_versions_work_for_atomic_display_publication(self):
+        await self.db.role_identities.update_one({"_id": self.identity["_id"]},
+            {"$set": {"jjc_kungfu": {"publish_version": Int64(6)}}})
+        self.assertTrue(await self.publish(Int64(7)))
+        row = await self.db.role_identities.find_one({"_id": self.identity["_id"]})
+        self.assertEqual(row.get("jjc_display"), display_publication_fixture(self.identity, self.scope, Int64(7)))
+
+    async def test_identity_change_blocks_both_kungfu_and_display_without_upsert(self):
+        await self.db.role_identities.update_one({"_id": self.identity["_id"]},
+            {"$set": {"global_id": "changed"}})
+        before = await self.db.role_identities.find_one({"_id": self.identity["_id"]})
+        self.assertFalse(await self.publish(1))
+        self.assertEqual(await self.db.role_identities.find_one({"_id": self.identity["_id"]}), before)
+        await self.db.role_identities.delete_one({"_id": self.identity["_id"]})
+        self.assertFalse(await self.publish(1))
+        self.assertEqual(await self.db.role_identities.count_documents({}), 0)
+
+    async def test_identity_upgrade_and_query_id_repair_preserve_both_result_subobjects(self):
+        display = display_publication_fixture(self.identity, self.scope, 1)
+        kungfu = self.result(1)
+        await self.db.role_identities.update_one({"_id": self.identity["_id"]}, {"$set": {
+            "identity_key": "game:zone-a:42", "identity_level": "game_role",
+            "normalized_server": "server-a", "normalized_name": "role-a",
+            "jjc_display": display, "jjc_kungfu": kungfu}})
+        upgraded = await self.roles.upsert_from_ranking_with_id(
+            server="server-a", name="role-a", zone="zone-a", game_role_id="42",
+            role_id="42", global_role_id="SK01-a", global_id="90042")
+        self.assertEqual(upgraded["_id"], self.identity["_id"])
+        self.assertEqual(upgraded["identity_key"], "global_id:90042")
+        self.assertEqual(upgraded["jjc_display"], display)
+        self.assertEqual(upgraded["jjc_kungfu"], kungfu)
+        self.assertTrue(await self.roles.replace_query_ids_if_unchanged(
+            upgraded, game_role_id="420", role_id="420", observed_at=datetime.now(timezone.utc)))
+        repaired = await self.roles.get_by_id(self.identity["_id"])
+        self.assertEqual(repaired["game_role_id"], "420")
+        self.assertEqual(repaired["jjc_display"], display)
+        self.assertEqual(repaired["jjc_kungfu"], kungfu)
 
 
 @unittest.skipUnless(os.environ.get("JJC_TEST_MONGO_URI"), "explicit local Mongo URI required")
@@ -351,9 +482,13 @@ class TestRefreshQueueMongo(unittest.IsolatedAsyncioTestCase):
         reading, resume = asyncio.Event(), asyncio.Event()
         original_read = RoleIdentityRepo.get_by_id
         background = None
+        gate_next_read = True
 
         async def gated_read(repo, identity_id):
-            if asyncio.current_task() is background:
+            nonlocal gate_next_read
+            # Python 3.9 wait_for executes the attempt in a child Task.
+            if gate_next_read:
+                gate_next_read = False
                 reading.set()
                 await resume.wait()
             return await original_read(repo, identity_id)

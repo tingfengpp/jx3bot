@@ -16,6 +16,10 @@ except Exception:  # pragma: no cover
         logging.basicConfig(level=logging.INFO)
 
 
+from src.utils.jjc_query_observability import foreground_safe_logger
+
+logger = foreground_safe_logger(logger, component="inspect")
+
 def get_role_indicator(
     role_id: str,
     zone: str,

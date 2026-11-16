@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -63,8 +64,33 @@ class JjcMatchSnapshotRepo:
             logger.warning("保存奇穴快照失败: hash={} error={}", snapshot_hash, exc)
             raise
 
+    async def load_local_win_equipment_snapshots(self, snapshot_hashes):
+        """Complete, native-bounded equipment reads; no legacy loader side effects."""
+        if not snapshot_hashes:
+            return {}
+        db = self.db if self.db is not None else _get_db()
+        cursor = db.jjc_equipment_snapshot.find({"snapshot_hash": {"$in": snapshot_hashes}})
+        primary_error = None
+        try:
+            cursor = cursor.max_time_ms(1500).batch_size(512)
+            result = {}
+            async for doc in cursor:
+                result[doc["snapshot_hash"]] = doc
+            return result
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                # Cancelling the async close wait is not proof that a submitted
+                # driver operation stopped; the dedicated socket budget remains.
+                await asyncio.wait_for(cursor.close(), timeout=0.1)
+            except BaseException:
+                if primary_error is None:
+                    raise
+
     async def load_equipment_snapshots(
-        self, snapshot_hashes: List[str]
+        self, snapshot_hashes: List[str], *, strict: bool = False
     ) -> Dict[str, Dict[str, Any]]:
         if not snapshot_hashes:
             return {}
@@ -78,6 +104,8 @@ class JjcMatchSnapshotRepo:
                 result[doc["snapshot_hash"]] = doc
             return result
         except Exception as exc:
+            if strict:
+                raise
             logger.warning("批量读取装备快照失败: hashes={} error={}", snapshot_hashes, exc)
             return {}
 
