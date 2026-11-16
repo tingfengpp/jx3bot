@@ -16,6 +16,10 @@ except Exception:  # pragma: no cover
 
     logger = logging.getLogger(__name__)
 
+from src.utils.jjc_query_observability import foreground_safe_logger
+
+logger = foreground_safe_logger(logger, component="cache")
+
 
 def _normalize_role_name(raw_name: Any, player_server: Any, target_server: str) -> str:
     """对 role_name 做归一化：仅当末尾 ·xxx 等于 own server 或 target server 时去除。"""
@@ -177,14 +181,19 @@ class JjcCacheRepo:
         zone: Optional[str] = None,
         game_role_id: Optional[str] = None,
         global_id: Optional[str] = None,
+        global_role_id: Optional[str] = None,
+        preserve_id: bool = False,
     ) -> Optional[dict[str, Any]]:
         identity_repo = self._get_identity_repo()
-        return await identity_repo.resolve_best_identity(
+        hints = {"global_role_id": global_role_id} if global_role_id else {}
+        finder = identity_repo.resolve_best_identity_with_id if preserve_id else identity_repo.resolve_best_identity
+        return await finder(
             server=server,
             name=name,
             zone=zone,
             game_role_id=game_role_id,
             global_id=global_id,
+            **hints,
         )
 
     async def upsert_role_identity_from_indicator(
@@ -198,6 +207,7 @@ class JjcCacheRepo:
         role_id: Optional[str],
         person_id: Optional[str] = None,
         global_id: Optional[str] = None,
+        preserve_id: bool = False,
     ) -> dict[str, Any]:
         identity_repo = self._get_identity_repo()
         jjc_repo = self._get_jjc_cache_repo()
@@ -211,6 +221,7 @@ class JjcCacheRepo:
             person_id=person_id,
             global_id=global_id,
             cache_repo=jjc_repo,
+            **({"preserve_id": True} if preserve_id else {}),
         )
 
     async def load_new_kungfu_cache_raw(self, server: str, name: str) -> Optional[dict[str, Any]]:

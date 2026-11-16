@@ -3,6 +3,7 @@
 包含API Token、URL等
 """
 import json
+import logging
 import os
 ADMIN_QQ = [595910443]
 
@@ -16,6 +17,16 @@ def _env_int(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
+
+def _local_equipment_flag(value, *, source):
+    """Strict opt-in; diagnostics deliberately contain no supplied value."""
+    if type(value) is int and value in (0, 1):
+        return value
+    if type(value) is str and value.strip() in ("0", "1"):
+        return int(value.strip())
+    logging.getLogger(__name__).warning(
+        "Invalid configuration key=JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED source=%s; disabled", source)
+    return 0
 
 # API认证凭证
 TOKEN = ""
@@ -147,6 +158,13 @@ JJC_KUNGFU_REFRESH_SECONDS = _env_int("JJC_KUNGFU_REFRESH_SECONDS", 21600)
 JJC_KUNGFU_MAX_STALE_SECONDS = _env_int("JJC_KUNGFU_MAX_STALE_SECONDS", 86400)
 JJC_KUNGFU_TRACK_SECONDS = _env_int("JJC_KUNGFU_TRACK_SECONDS", 172800)
 
+# 排名展示与本地最新胜场装备独立开关，默认关闭，变更后重启。
+JJC_RANKING_DISPLAY_QUERY_ENABLED = int(os.getenv("JJC_RANKING_DISPLAY_QUERY_ENABLED", "0").strip() == "1")
+JJC_RANKING_DISPLAY_OVERLAY_ENABLED = int(os.getenv("JJC_RANKING_DISPLAY_OVERLAY_ENABLED", "0").strip() == "1")
+JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED = _local_equipment_flag(
+    os.getenv("JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED", "0"), source="environment")
+JJC_EQUIPMENT_MONGO_HOST = os.getenv("JJC_EQUIPMENT_MONGO_HOST", "")
+
 # 最新列表刷新默认关闭；开启前配置有效推栏凭据与来源密钥。
 JJC_LIVE_REFRESH_ENABLED = _env_int("JJC_LIVE_REFRESH_ENABLED", 0)
 JJC_ROLE_IDENTITY_RECOVERY_ENABLED = _env_int("JJC_ROLE_IDENTITY_RECOVERY_ENABLED", 0)
@@ -211,6 +229,10 @@ KUNGFU_META = {
 # 运行时可覆盖配置（由 /修改配置 写入）
 RUNTIME_CONFIG_FILE = "runtime_config.json"
 RUNTIME_CONFIG_KEYS = {
+    "JJC_RANKING_DISPLAY_QUERY_ENABLED": int,
+    "JJC_RANKING_DISPLAY_OVERLAY_ENABLED": int,
+    "JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED": int,
+    "JJC_EQUIPMENT_MONGO_HOST": str,
     "JJC_RANKING_KUNGFU_CACHE_ENABLED": int,
     "JJC_KUNGFU_REFRESH_ENABLED": int,
     "JJC_KUNGFU_REFRESH_SECONDS": int,
@@ -237,7 +259,13 @@ if os.path.exists(RUNTIME_CONFIG_FILE):
         for _key, _type in RUNTIME_CONFIG_KEYS.items():
             if _key in _runtime_config:
                 try:
-                    globals()[_key] = _type(_runtime_config[_key])
+                    if _key == "JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED":
+                        globals()[_key] = _local_equipment_flag(_runtime_config[_key], source="runtime_config.json")
+                    elif _key in ("JJC_RANKING_DISPLAY_QUERY_ENABLED", "JJC_RANKING_DISPLAY_OVERLAY_ENABLED"):
+                        _flag = _runtime_config[_key]
+                        globals()[_key] = int((type(_flag) is int and _flag == 1) or (type(_flag) is str and _flag.strip() == "1"))
+                    else:
+                        globals()[_key] = _type(_runtime_config[_key])
                 except (TypeError, ValueError):
                     pass
     except Exception:

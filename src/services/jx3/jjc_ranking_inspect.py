@@ -6,13 +6,19 @@ import inspect
 import threading
 import time
 from weakref import WeakKeyDictionary
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from nonebot import logger
+from src.utils.jjc_query_observability import (foreground_safe_logger, begin_query_trace,
+    end_query_trace, query_stage, observed_query_stage, query_queue, query_cache, query_failure)
+
+logger = foreground_safe_logger(logger, component="inspect")
 import config as cfg
 
 from src.services.jx3.jjc_cache_repo import JjcCacheRepo
+from src.infra.jjc_foreground_mongo import (ForegroundMongoFailure, ForegroundMongoSession, default_controller)
+from src.utils.jjc_indicator_cache import indicator_cache_age, normalize_indicator_scope
 from src.services.jx3.jjc_ranking import JjcRankingService
 from src.services.jx3.indicator_utils import parse_3v3_indicator
 from src.services.jx3.kungfu import (
@@ -27,6 +33,11 @@ from src.storage.mongo_repos.jjc_inspect_repo import JjcInspectRepo
 from src.storage.mongo_repos.jjc_sync_repo import JjcSyncRepo
 from src.storage.mongo_repos.role_identity_repo import RoleIdentityRepo
 from src.services.jx3.role_identity_recovery import indicator_matches_request, recover_query_ids
+from src.services.jx3.jjc_role_query_context import (
+    ForegroundQueryContext, ForegroundQueryError, ForegroundQueryTimeout, ForegroundQueryBusy,
+    identity_binding, indicator_binding_matches, identity_hints_conflict, local_lookup_hints,
+    ranking_name_matches, role_name_candidates, foreground_flights, release_after_owners,
+)
 
 
 SYNCED_MATCH_PAGE_SYNC_PRIORITY = 2
@@ -74,11 +85,8 @@ def _extract_grade_like_fields(match: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_name(name: Optional[str]) -> str:
-    if not name:
-        return ""
-    if "·" in name:
-        return name.split("·")[0]
-    return name
+    # This is also used on already confirmed names. Never strip a second time.
+    return str(name or "").strip()
 
 
 def _pick_str(*values: Any) -> Optional[str]:
@@ -254,9 +262,19 @@ class JjcRankingInspectService:
     sync_repo: Any = None
     role_recent_ttl_seconds: int = 86400
     role_indicator_ttl_seconds: int = 86400
+    role_indicator_stale_grace_seconds: int = 3600
+    # A completion observation must fit the foreground freshness window.
+    resolution_indicator_max_age_seconds: float = 10.0
     current_season: str = ""
     season_start_time: int = 0
     max_recent_matches: int = 20
+    foreground_client: Any = None
+    foreground_mongo_controller: Any = None
+    foreground_timeout_seconds: float = 10.0
+    foreground_queue_wait_seconds: float = 0.3
+    foreground_cleanup_seconds: float = 0.25
+    query_context: Any = field(default=None, repr=False)
+    _foreground_token: Any = field(default_factory=object, init=False, repr=False)
     cache_hit_replay_enrich_timeout_seconds: float = 5.0
     _tuilan_query_locks: WeakKeyDictionary = field(default_factory=WeakKeyDictionary, init=False, repr=False)
     _tuilan_query_locks_guard: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -303,6 +321,9 @@ class JjcRankingInspectService:
             "global_id",
             "global_role_id",
             "role_id",
+            "person_id",
+            "identity_level",
+            "source",
         ):
             value = identity.get(key)
             if value is not None:
@@ -341,11 +362,27 @@ class JjcRankingInspectService:
                     result["queue_position"] = position
         return result
 
-    async def _resolve_synced_identity_only(self, *, server: str, name: str) -> Optional[dict[str, Any]]:
+    async def _resolve_synced_identity_only(
+        self, *, server: str, name: str, identity_hints: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
         repo = self._role_identity_repo()
-        if hasattr(repo, "find_best_by_name_with_id"):
-            return await repo.find_best_by_name_with_id(server, name)
-        return await repo.resolve_best_identity_with_id(server=server, name=name)
+        hints = identity_hints or {}
+        strong = hints.get("global_id") or hints.get("global_role_id") or (
+            hints.get("zone") and (hints.get("game_role_id") or hints.get("role_id"))
+        )
+        finder = getattr(repo, "resolve_best_identity_with_id", None)
+        if strong and callable(finder):
+            identity = await _maybe_await(finder(server=server, name=name, **local_lookup_hints(hints)))
+            if isinstance(identity, dict) and identity:
+                return identity
+        for candidate in role_name_candidates(server, name):
+            if hasattr(repo, "find_best_by_name_with_id"):
+                identity = await repo.find_best_by_name_with_id(server, candidate)
+            else:
+                identity = await repo.resolve_best_identity_with_id(server=server, name=candidate)
+            if isinstance(identity, dict) and identity:
+                return identity
+        return None
 
     async def _find_synced_role_candidates(self, *, server: str, name: str, limit: int = 8) -> List[Dict[str, Any]]:
         repo = self._role_identity_repo()
@@ -604,18 +641,239 @@ class JjcRankingInspectService:
         except Exception as exc:
             logger.warning("JJC 对局详情 replay 后台补全任务失败: error={}".format(exc))
 
-    async def _run_serialized_tuilan_query(
-        self,
-        endpoint_key: str,
-        label: str,
-        func: Callable[..., Any],
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        async with self._get_tuilan_query_lock(endpoint_key):
-            return await asyncio.to_thread(func, *args, **kwargs)
+    @staticmethod
+    def _consume_foreground_task(task) -> None:
+        if not task.cancelled():
+            task.exception()
 
-    async def get_role_recent(
+    @staticmethod
+    def foreground_snapshot():
+        return foreground_flights().snapshot()
+
+    def _foreground_key(self, kind, kwargs, identity=None):
+        hints = kwargs.get('identity_hints') or kwargs
+        locator = (str(kwargs.get('server') or '').strip(), _normalize_name(kwargs.get('name')))
+        if identity:
+            query_cache(key_type="canonical")
+            locator = (str(identity.get('identity_key') or ''), str(identity.get('server') or ''),
+                       str(identity.get('name') or ''))
+        return (asyncio.get_running_loop(), self._foreground_token, kind, locator,
+                bool(kwargs.get('identity_only')), bool(kwargs.get('force_refresh')),
+                *(str(hints.get(field) or '') for field in
+                  ('global_id', 'global_role_id', 'game_role_id', 'role_id', 'zone')),
+                kwargs.get('cursor', 0) if kind == 'recent' else None)
+
+    async def _foreground_request(self, kind: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        trace, token = begin_query_trace(kind)
+        context = ForegroundQueryContext(
+            timeout=self.foreground_timeout_seconds, queue_wait=self.foreground_queue_wait_seconds,
+            cleanup=self.foreground_cleanup_seconds,
+        )
+        registry = foreground_flights()
+        admitted = False
+        result = None
+        try:
+            registry.admit()
+            admitted = True
+            result = await registry.run(self._foreground_key(kind, kwargs), context,
+                lambda owner: self._execute_foreground(kind, kwargs, owner))
+            return result
+        except asyncio.CancelledError:
+            trace.cancelled = True
+            raise
+        except (asyncio.TimeoutError, ForegroundQueryTimeout):
+            result = {'error': True, 'message': 'indicator_query_timeout'}
+            return result
+        except (ForegroundQueryError, ForegroundMongoFailure) as exc:
+            result = {'error': True, 'message': exc.code}
+            return result
+        except Exception as exc:
+            query_failure('dependency_error', exc)
+            result = {'error': True, 'message': 'indicator_unavailable'}
+            return result
+        finally:
+            try:
+                if admitted:
+                    registry.leave()
+                trace.finish(result, registry.snapshot())
+            finally:
+                end_query_trace(token)
+
+    async def _execute_foreground(self, kind, kwargs, context, *, prepare=True):
+        mongo = ForegroundMongoSession(context, self.foreground_mongo_controller or default_controller())
+        context.mongo = mongo
+        context.force_refresh = bool(kwargs.get('force_refresh', getattr(context, 'force_refresh', False)))
+        service = replace(self, query_context=context,
+                          kungfu_cache_repo=mongo.bind_repo(self.kungfu_cache_repo),
+                          cache_repo=mongo.bind_repo(self.cache_repo),
+                          role_identity_repo=mongo.bind_repo(self._role_identity_repo()))
+        for name in ('_tuilan_query_locks', '_tuilan_query_locks_guard',
+                     '_identity_recovery_tasks', '_identity_recovery_cooldown', '_foreground_token'):
+            object.__setattr__(service, name, getattr(self, name))
+        ranking = self.ranking_service
+        if is_dataclass(ranking) and 'query_context' in {item.name for item in fields(ranking)}:
+            ranking = replace(ranking, query_context=context, foreground_client=self.foreground_client)
+            object.__setattr__(service, 'ranking_service', ranking)
+
+        async def business():
+            if prepare:
+                hints = kwargs.get('identity_hints') or kwargs
+                server, name = str(kwargs.get('server') or '').strip(), _normalize_name(kwargs.get('name'))
+                if not server or not name:
+                    return {'error': True, 'message': 'invalid_params'}
+                with query_stage("identity"):
+                    local = None
+                    if kwargs.get('identity_only'):
+                        local = await service._resolve_synced_identity_only(server=server, name=name, identity_hints=hints)
+                    else:
+                        for candidate in role_name_candidates(server, name):
+                            local = await _maybe_await(service.kungfu_cache_repo.resolve_role_identity(
+                                server=server, name=candidate, **local_lookup_hints(hints), preserve_id=True))
+                            if isinstance(local, dict) and local:
+                                break
+                            local = None
+                context.local_identity = local
+                if local:
+                    if identity_hints_conflict(local, server, hints):
+                        return {'error': True, 'message': 'indicator_identity_conflict'}
+                    other = foreground_flights().promote(self._foreground_key(kind, kwargs, local), context)
+                    if other is not None:
+                        return await foreground_flights().wait(other, context)
+                method = service._get_role_indicator_entry if kind == 'indicator' else service._get_role_recent_once
+            else:
+                local = getattr(context, 'local_identity', None)
+                if local and not local.get('global_role_id'):
+                    # Different force semantics must never share raw. Serialize
+                    # partial completion, then re-read facts before issuing this
+                    # owner's HTTP; another verified completion may now exist.
+                    lock = await service._acquire_query_lock('identity_completion')
+                    try:
+                        latest = await _maybe_await(service.kungfu_cache_repo.resolve_role_identity(
+                            server=local.get('server'), name=local.get('name'),
+                            **local_lookup_hints(kwargs.get('identity_hints') or {}), preserve_id=True))
+                        context.local_identity = latest if isinstance(latest, dict) and latest else None
+                        return await service._resolve_role_identity_once(**kwargs)
+                    finally:
+                        lock.release()
+                method = service._resolve_role_identity_once
+            effective = dict(kwargs)
+            if prepare and local:
+                effective['name'] = local.get('name') or effective.get('name')
+            return await method(**effective)
+
+        owner = asyncio.create_task(business())
+        owner.add_done_callback(self._consume_foreground_task)
+        try:
+            context.check()
+            result = await asyncio.wait_for(asyncio.shield(owner), timeout=context.remaining())
+            context.check()
+            return result
+        except (asyncio.TimeoutError, ForegroundQueryTimeout):
+            return {'error': True, 'message': 'indicator_query_timeout'}
+        except (ForegroundQueryError, ForegroundMongoFailure) as exc:
+            return {'error': True, 'message': exc.code}
+        finally:
+            with query_stage("cleanup"):
+                cleanup_deadline = time.monotonic() + min(.25, context.cleanup)
+                context.cancelled = True
+                if not owner.done():
+                    owner.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(owner), timeout=max(0.0, cleanup_deadline - time.monotonic()))
+                    except (asyncio.TimeoutError, asyncio.CancelledError, ForegroundQueryError, ForegroundMongoFailure):
+                        pass
+                await mongo.settle(max(0.0, cleanup_deadline - time.monotonic()))
+
+    async def _acquire_query_lock(self, endpoint_key):
+        lock = self._get_tuilan_query_lock(endpoint_key)
+        context = self.query_context
+        if context is None:
+            await lock.acquire()
+            return lock
+        context.check()
+        queued_at = time.monotonic()
+        try:
+            await asyncio.wait_for(lock.acquire(), min(context.queue_wait, context.remaining()))
+        except asyncio.TimeoutError:
+            context.check()
+            raise ForegroundQueryBusy() from None
+        finally:
+            query_queue(time.monotonic() - queued_at)
+        try:
+            context.check()
+        except BaseException:
+            lock.release()
+            raise
+        return lock
+
+    async def _run_serialized_tuilan_query(
+        self, endpoint_key: str, label: str, func: Callable[..., Any],
+        *args: Any, **kwargs: Any,
+    ) -> Any:
+        context = self.query_context
+        lock = self._get_tuilan_query_lock(endpoint_key)
+
+        async def acquire():
+            await self._acquire_query_lock(endpoint_key)
+
+        if context is not None and self.foreground_client is not None:
+            await acquire()
+            physical_owners = set()
+            def retain(owner):
+                physical_owners.add(owner)
+                owner.add_done_callback(physical_owners.discard)
+                recovery_owners = context.recovery_physical_owners
+                recovery_owners.add(owner)
+                owner.add_done_callback(recovery_owners.discard)
+            try:
+                if endpoint_key == "role_indicator":
+                    params = {key: kwargs.get(key, args[index] if len(args) > index else None)
+                              for index, key in enumerate(("role_id", "zone", "server"))}
+                else:
+                    params = {key: value for key, value in kwargs.items()
+                              if key in {"global_role_id", "size", "cursor", "match_id"}}
+                    if args and "match_id" not in params:
+                        params["match_id"] = args[0]
+                tracked_request = getattr(self.foreground_client, 'request_with_owner', None)
+                if callable(tracked_request):
+                    result = await tracked_request(endpoint_key, params, deadline=context.deadline, on_owner=retain)
+                else:
+                    result = await self.foreground_client.request(endpoint_key, params, deadline=context.deadline)
+                context.check()
+                return result
+            finally:
+                # The original lease survives frontend cleanup until IO ends.
+                release_after_owners(lock.release, physical_owners)
+
+        submitted = asyncio.Event()
+        physical_owner = getattr(context, 'recovery_physical_owners', None) if context else None
+        async def synchronous_owner():
+            await acquire()
+            try:
+                submitted.set()
+                return await asyncio.to_thread(func, *args, **kwargs)
+            finally:
+                lock.release()
+        owner = asyncio.create_task(synchronous_owner())
+        if physical_owner is not None:
+            physical_owner.add(owner)
+            owner.add_done_callback(physical_owner.discard)
+        owner.add_done_callback(self._consume_foreground_task)
+        try:
+            result = await asyncio.shield(owner)
+            if context is not None:
+                context.check()
+            return result
+        except asyncio.CancelledError:
+            if not submitted.is_set():
+                owner.cancel()
+            # Submitted synchronous work owns the lock until its real return.
+            raise
+
+    async def get_role_recent(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._foreground_request("recent", kwargs)
+
+    async def _get_role_recent_once(
         self,
         *,
         server: str,
@@ -624,6 +882,16 @@ class JjcRankingInspectService:
         cursor: int = 0,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
+        server, name = str(server or "").strip(), _normalize_name(name)
+        if not server or not name:
+            return {"error": True, "message": "invalid_params"}
+        resolution = await self._resolve_role_identity(
+            server=server, name=name, identity_hints=identity_hints or {},
+        )
+        if resolution.get("error"):
+            return resolution
+        identity = self._serialize_identity(resolution["identity"])
+        name = _pick_str(identity.get("name")) or name
         is_first_page = cursor <= 0
         if is_first_page and not force_refresh:
             cached = await self.cache_repo.load_role_recent(
@@ -636,8 +904,14 @@ class JjcRankingInspectService:
                 cached_data.get("current_season") == self.current_season
                 and cached_data.get("season_start_time") == self.season_start_time
             )
-            if cached and same_season:
+            cached_identity = cached_data.get("identity")
+            same_identity = bool(cached_identity) and isinstance(cached_identity, dict) and self._cached_indicator_matches_identity(
+                identity, cached_identity,
+            )
+            if cached and same_season and same_identity:
                 data = copy.deepcopy(cached_data)
+                data["identity"] = self._serialize_identity(identity)
+                data["player"] = {"server": server, "name": name}
                 raw_matches = data.get("recent_matches") or []
                 recent_matches = filter_current_season_matches(
                     raw_matches, season_start_time=self.season_start_time,
@@ -657,10 +931,6 @@ class JjcRankingInspectService:
                     "force_refresh": False,
                 }
                 return data
-
-        identity = await self._resolve_role_identity(server=server, name=name, identity_hints=identity_hints or {})
-        if identity.get("error"):
-            return identity
 
         payload = await self._build_role_recent_payload(server=server, name=name, identity=identity, cursor=cursor)
         if payload.get("error"):
@@ -702,6 +972,13 @@ class JjcRankingInspectService:
         return True
 
     async def get_role_indicator(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._foreground_request("indicator", kwargs)
+
+    async def _get_role_indicator_entry(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs["server"] = str(kwargs.get("server") or "").strip()
+        kwargs["name"] = _normalize_name(kwargs.get("name"))
+        if not kwargs["server"] or not kwargs["name"]:
+            return {"error": True, "message": "invalid_params"}
         if not getattr(cfg, "JJC_ROLE_IDENTITY_RECOVERY_ENABLED", 0):
             return await self._get_role_indicator_once(**kwargs)
         key = (kwargs.get("server"), _normalize_name(kwargs.get("name") or ""),
@@ -711,432 +988,546 @@ class JjcRankingInspectService:
         cooldown = self._identity_recovery_cooldown.get(key)
         if cooldown and cooldown[0] > time.monotonic():
             return copy.deepcopy(cooldown[1])
-        loop_key = (asyncio.get_running_loop(), key, bool(kwargs.get("force_refresh")))
-        running = self._identity_recovery_tasks.get(loop_key)
-        if running is not None:
-            return await asyncio.shield(running)
-        if len(self._identity_recovery_tasks) >= 1024:
-            return {"error": True, "message": "indicator_recovery_busy"}
-        task = asyncio.create_task(self._get_role_indicator_once(**kwargs))
-        self._identity_recovery_tasks[loop_key] = task
-        try:
-            result = await asyncio.shield(task)
-            if result.get("error") and result.get("message") != "indicator_recovery_busy":
-                self._identity_recovery_cooldown.pop(key, None)
-                self._identity_recovery_cooldown[key] = (time.monotonic() + 180, copy.deepcopy(result))
-                while len(self._identity_recovery_cooldown) > 1024:
-                    self._identity_recovery_cooldown.pop(next(iter(self._identity_recovery_cooldown)))
+        result = await self._get_role_indicator_once(**kwargs)
+        genuine = bool(getattr(self.query_context, 'identity_recovery_failed', False))
+        if genuine:
+            self._identity_recovery_cooldown.pop(key, None)
+            self._identity_recovery_cooldown[key] = (time.monotonic() + 180, copy.deepcopy(result))
+            while len(self._identity_recovery_cooldown) > 1024:
+                self._identity_recovery_cooldown.pop(next(iter(self._identity_recovery_cooldown)))
+        return result
+
+    @staticmethod
+    def _resolution_packet(result: dict[str, Any], allowed_names: tuple[str, ...], *,
+                           snapshot: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        if result.get("error"):
             return result
-        finally:
-            # A cancelled caller must not drop an active same-role recovery task.
-            if task.done():
-                self._identity_recovery_tasks.pop(loop_key, None)
-            else:
-                task.add_done_callback(lambda done: self._identity_recovery_tasks.pop(loop_key, None))
+        if isinstance(result.get("identity"), dict):
+            packet = copy.deepcopy(result)
+        else:
+            packet = {"identity": copy.deepcopy(result), "identity_source": result.get("source")}
+        if snapshot is not None:
+            packet["identity_snapshot"] = copy.deepcopy(snapshot)
+        packet["allowed_names"] = allowed_names
+        return packet
+
+    async def _identity_snapshot_is_current(self, snapshot: dict[str, Any]) -> bool:
+        source_id = snapshot.get("_id") or snapshot.get("identity_id")
+        if source_id is None:
+            return False
+        latest = await self._role_identity_repo().get_by_id(source_id)
+        return isinstance(latest, dict) and identity_binding(latest) == identity_binding(snapshot)
+
+    @staticmethod
+    def _indicator_matches_identity(identity: dict[str, Any], raw: Any, *, role_id: str,
+                                    zone: str, server: str, allowed_names: tuple[str, ...],
+                                    request_hints: Optional[dict[str, Any]] = None) -> bool:
+        if not indicator_matches_request(identity, raw, role_id=role_id, zone=zone, server=server):
+            return False
+        info = raw["data"]["role_info"]
+        actual = {**info, "global_role_id": info.get("global_role_id") or info.get("globalRoleId")}
+        query_alias = info.get("role_id") if info.get("role_id") is not None else info.get("roleId")
+        if query_alias is not None:
+            actual["role_id"] = query_alias
+        stable_constraints = {field: (request_hints or {}).get(field)
+                              for field in ("global_id", "global_role_id")}
+        if (identity_hints_conflict(actual, server, identity)
+                or identity_hints_conflict(actual, server, stable_constraints)):
+            return False
+        actual_name = _pick_str(info.get("name"))
+        return not actual_name or actual_name in allowed_names
+
+    def _role_indicator_scope(self) -> Optional[dict[str, Any]]:
+        return normalize_indicator_scope({"season_id": self.current_season,
+                                          "season_start": self.season_start_time, "pvp_type": 3})
+
+    def _indicator_cache_state(self, cached: dict[str, Any], *, now: Optional[float] = None) -> Optional[str]:
+        age = indicator_cache_age(cached.get("cached_at"), time.time() if now is None else now)
+        if age is None or not isinstance(cached.get("indicator"), dict) or not cached["indicator"]:
+            return None
+        expected = self._role_indicator_scope()
+        if "scope" in cached:
+            scope = normalize_indicator_scope(cached["scope"])
+            if scope is None or expected is None or scope != expected:
+                return None
+        else:
+            # Unknown season configuration retains old callers' fresh behavior;
+            # legacy records never gain stale eligibility.
+            if self.season_start_time > 0 and cached["cached_at"] <= self.season_start_time:
+                return None
+            return "fresh" if age < self.role_indicator_ttl_seconds else None
+        if age < self.role_indicator_ttl_seconds:
+            return "fresh"
+        if age < self.role_indicator_ttl_seconds + self.role_indicator_stale_grace_seconds:
+            return "stale"
+        return None
+
+    def _indicator_cache_response(self, identity: dict[str, Any], cached: dict[str, Any], *,
+                                  stale: bool, now: float, error_code: Optional[str] = None) -> dict[str, Any]:
+        query_cache(format="scoped" if "scope" in cached else "legacy")
+        result = {"player": {"server": identity.get("server"), "name": identity.get("name")},
+                  "identity": copy.deepcopy(identity), "indicator": copy.deepcopy(cached["indicator"]),
+                  "raw": copy.deepcopy(cached["raw"]),
+                  "cache": {"hit": True, "cached_at": cached["cached_at"],
+                            "ttl_seconds": self.role_indicator_ttl_seconds, "stale": stale,
+                            "age_seconds": indicator_cache_age(cached["cached_at"], now)}}
+        if stale:
+            result["refresh"] = {"state": "failed", "error_code": error_code, "retryable": True}
+        return result
 
     async def _get_role_indicator_once(
-        self,
-        *,
-        server: str,
-        name: str,
-        game_role_id: Optional[str] = None,
-        global_role_id: Optional[str] = None,
-        global_id: Optional[str] = None,
-        role_id: Optional[str] = None,
-        zone: Optional[str] = None,
-        force_refresh: bool = False,
-        identity_only: bool = False,
+        self, *, server: str, name: str, game_role_id: Optional[str] = None,
+        global_role_id: Optional[str] = None, global_id: Optional[str] = None,
+        role_id: Optional[str] = None, zone: Optional[str] = None,
+        force_refresh: bool = False, identity_only: bool = False,
     ) -> dict[str, Any]:
-        raw_identity = None
+        hints = {"game_role_id": game_role_id, "global_role_id": global_role_id,
+                 "global_id": global_id, "role_id": role_id, "zone": zone}
         if identity_only:
-            raw_identity = await self._resolve_synced_identity_only(server=server, name=name)
-            raw_identity = copy.deepcopy(raw_identity)
-            if not raw_identity:
-                return {
-                    "error": True,
-                    "message": "role_identity_not_found",
-                    "player": {"server": server, "name": _normalize_name(name)},
-                }
-            identity = self._serialize_identity(raw_identity)
-            if game_role_id and not identity.get("game_role_id"):
-                identity["game_role_id"] = game_role_id
-            if global_role_id and not identity.get("global_role_id"):
-                identity["global_role_id"] = global_role_id
-            if global_id and not identity.get("global_id"):
-                identity["global_id"] = global_id
-            if role_id and not identity.get("role_id"):
-                identity["role_id"] = role_id
-            if zone and not identity.get("zone"):
-                identity["zone"] = zone
+            if self.query_context is not None and hasattr(self.query_context, 'local_identity'):
+                stored = self.query_context.local_identity
+            else:
+                stored = await self._resolve_synced_identity_only(server=server, name=name, identity_hints=hints)
+            if not stored:
+                return {"error": True, "message": "role_identity_not_found",
+                        "player": {"server": server, "name": name}}
+            if identity_hints_conflict(stored, server, hints):
+                return {"error": True, "message": "indicator_identity_conflict"}
+            effective = copy.deepcopy(stored)
+            query_id = _pick_str(stored.get("game_role_id"), stored.get("role_id"), game_role_id, role_id)
+            effective["game_role_id"] = _pick_str(stored.get("game_role_id"), query_id)
+            effective["role_id"] = _pick_str(stored.get("role_id"), query_id)
+            effective["zone"] = _pick_str(stored.get("zone"), zone)
+            canonical_name = _pick_str(stored.get("name")) or name
+            resolution = self._resolution_packet(effective, (canonical_name,), snapshot=stored)
         else:
-            identity = await self._resolve_role_identity(
-                server=server,
-                name=name,
-                identity_hints={
-                    "game_role_id": game_role_id or None,
-                    "global_role_id": global_role_id or None,
-                    "global_id": global_id or None,
-                    "role_id": role_id or None,
-                    "zone": zone or None,
-                },
-            )
-            if identity.get("error"):
-                return identity
-
-        identity_key = identity.get("identity_key") or ""
+            resolution = await self._resolve_role_identity(server=server, name=name, identity_hints=hints)
+        if resolution.get("error"):
+            return resolution
+        resolved = resolution["identity"]
+        snapshot = resolution.get("identity_snapshot")
+        # Legacy locators are not canonical identity facts. Recheck the actual
+        # repository before cache reuse; never derive a numeric ID from a key.
+        if not isinstance(snapshot, dict):
+            canonical = await _maybe_await(self.kungfu_cache_repo.resolve_role_identity(
+                server=server, name=resolved.get("name") or name,
+                **local_lookup_hints(resolved), preserve_id=True,
+            ))
+            if isinstance(canonical, dict) and canonical:
+                if identity_hints_conflict(canonical, server, resolved):
+                    return {"error": True, "message": "indicator_identity_conflict"}
+                snapshot = copy.deepcopy(canonical)
+                resolved = {**resolved, **canonical}
+        identity = self._serialize_identity(resolved)
+        if resolution.get("identity_source"):
+            identity["source"] = resolution["identity_source"]
+        name = _pick_str(identity.get("name")) or name
+        allowed_names = tuple(resolution.get("allowed_names") or (name,))
+        if identity_hints_conflict(identity, server, hints):
+            return {"error": True, "message": "indicator_identity_conflict", "identity": identity}
+        identity_key = _pick_str(identity.get("identity_key"))
         if not identity_key:
             return {"error": True, "message": "identity_key_missing", "identity": identity}
+        query_id, query_zone = _pick_str(identity.get("game_role_id"), identity.get("role_id")), _pick_str(identity.get("zone"))
+        stale_cache = None
+        stale_cache_key_type = None
+        if not force_refresh and isinstance(snapshot, dict):
+            keys = [identity_key]
+            sk01_key = "global:" + str(snapshot.get("global_role_id") or "")
+            if snapshot.get("global_role_id") and sk01_key != identity_key:
+                keys.append(sk01_key)
+            for key in keys:
+                query_cache(key_type="canonical" if key == identity_key else "legacy")
+                read_options = {"ttl_seconds": self.role_indicator_ttl_seconds}
+                if self._role_indicator_scope() is not None:
+                    read_options["max_age_seconds"] = self.role_indicator_ttl_seconds + self.role_indicator_stale_grace_seconds
+                cached = await self.cache_repo.load_role_indicator(key, **read_options)
+                if not cached or not indicator_binding_matches(snapshot, cached):
+                    continue
+                if not self._indicator_matches_identity(snapshot, cached.get("raw"), role_id=query_id or "",
+                        zone=query_zone or "", server=server, allowed_names=allowed_names, request_hints=hints):
+                    continue
+                state = self._indicator_cache_state(cached)
+                if state == "fresh":
+                    if not await self._identity_snapshot_is_current(snapshot):
+                        return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+                    response_time = time.time()
+                    state = self._indicator_cache_state(cached, now=response_time)
+                    if state == "fresh":
+                        return self._indicator_cache_response(identity, cached, stale=False, now=response_time)
+                if state == "stale" and stale_cache is None:
+                    stale_cache = copy.deepcopy(cached)
+                    stale_cache_key_type = "canonical" if key == identity_key else "legacy"
 
-        cached = None
-        if not force_refresh:
-            cached = await self.cache_repo.load_role_indicator(
-                identity_key,
-                ttl_seconds=self.role_indicator_ttl_seconds,
-            )
-        if cached and self._cached_indicator_matches_identity(identity, cached):
-            return {
-                "player": {"server": server, "name": _normalize_name(name)},
-                "identity": identity,
-                "indicator": cached.get("indicator") or {},
-                "raw": cached.get("raw") or {},
-                "cache": {
-                    "hit": True,
-                    "cached_at": cached.get("cached_at"),
-                    "ttl_seconds": self.role_indicator_ttl_seconds,
-                },
-            }
+        async def refresh_failed(error_code: str) -> dict[str, Any]:
+            # Re-evaluate age and current binding after the attempted refresh;
+            # stale eligibility must not survive a query-ID/season boundary.
+            if (stale_cache is not None and self._indicator_cache_state(stale_cache) == "stale"
+                    and indicator_binding_matches(snapshot, stale_cache)):
+                if not await self._identity_snapshot_is_current(snapshot):
+                    return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+                response_time = time.time()
+                if self._indicator_cache_state(stale_cache, now=response_time) == "stale":
+                    query_cache(key_type=stale_cache_key_type)
+                    return self._indicator_cache_response(identity, stale_cache, stale=True,
+                                                          now=response_time, error_code=error_code)
+            return {"error": True, "message": error_code, "identity": identity}
 
-        resolved_game_role_id = _pick_str(identity.get("game_role_id"))
-        resolved_zone = _pick_str(identity.get("zone"))
         raw = None
-        recovery_enabled = bool(getattr(cfg, "JJC_ROLE_IDENTITY_RECOVERY_ENABLED", 0) and raw_identity)
-        if resolved_game_role_id and resolved_zone and not recovery_enabled:
-            raw = await self._run_serialized_tuilan_query(
-                "role_indicator",
-                f"role_indicator:{server}:{name}",
-                self.role_indicator_fetcher,
-                resolved_game_role_id,
-                resolved_zone,
-                server,
-                tuilan_request=self.tuilan_request,
-                rank=None,
-                name=name,
-            )
-        if recovery_enabled:
+        completed_request = resolution.get("indicator_request") or {}
+        completion_age = time.monotonic() - completed_request.get("requested_at", float("-inf"))
+        if (0 <= completion_age < self.resolution_indicator_max_age_seconds and completed_request.get("role_id") == query_id
+                and completed_request.get("zone") == query_zone and completed_request.get("server") == server
+                and self._indicator_matches_identity(identity, resolution.get("indicator_raw"), role_id=query_id,
+                    zone=query_zone, server=server, allowed_names=allowed_names, request_hints=hints)):
+            raw = copy.deepcopy(resolution["indicator_raw"])
+        recovery_enabled = bool(getattr(cfg, "JJC_ROLE_IDENTITY_RECOVERY_ENABLED", 0) and identity_only and snapshot)
+        if raw is None and query_id and query_zone and not recovery_enabled:
+            try:
+                raw = await self._run_serialized_tuilan_query(
+                    "role_indicator", f"role_indicator:{server}:{name}", self.role_indicator_fetcher,
+                    query_id, query_zone, server, tuilan_request=self.tuilan_request, rank=None, name=name,
+                )
+            except ForegroundQueryBusy:
+                return await refresh_failed('indicator_query_busy')
+            except (ForegroundQueryError, ForegroundMongoFailure, asyncio.TimeoutError):
+                raise
+            except Exception as exc:
+                logger.warning("JJC indicator transport failed: {}", type(exc).__name__)
+                return await refresh_failed("indicator_unavailable")
+        if recovery_enabled and raw is None:
             try:
                 loader = getattr(self.kungfu_cache_repo, "load_query_id_recovery_candidates", None)
                 try:
-                    candidates = await loader(raw_identity) if callable(loader) else []
+                    candidates = await loader(snapshot) if callable(loader) else []
                 except Exception as exc:
                     logger.warning("JJC recovery locators unavailable: {}", exc)
                     candidates = []
+                constraint_mismatches = []
+                async def fetch_indicator(**query: Any) -> Any:
+                    fetched = await self._run_serialized_tuilan_query(
+                        'role_indicator', 'foreground_recovery', self.role_indicator_fetcher,
+                        query['role_id'], query['zone'], query['server'],
+                        tuilan_request=self.tuilan_request, rank=None, name=name)
+                    # A missing/invalid current locator must still reach the
+                    # existing bounded recovery alternatives. Only contradictory
+                    # original stable hints stop the recovery before publication.
+                    data = fetched.get("data") if isinstance(fetched, dict) else None
+                    info = data.get("role_info") if isinstance(data, dict) else None
+                    if isinstance(info, dict):
+                        actual = {**info, "global_role_id": info.get("global_role_id") or info.get("globalRoleId")}
+                        constraints = {field: hints.get(field) for field in ("global_id", "global_role_id")}
+                        if identity_hints_conflict(actual, query["server"], constraints):
+                            constraint_mismatches.append(True)
+                            # This locator supplies no usable identity evidence;
+                            # it is not a transport failure. The existing bounded
+                            # candidate/replay loop must still be allowed to run.
+                            return {"code": 0, "data": {}}
+                        alias = info.get("roleId")
+                        if (info.get("role_id") is None and alias is not None
+                                and str(alias) != str(query["role_id"])):
+                            # Expose a contradictory alias to the legacy guard so
+                            # it rejects this locator before any CAS. Valid raw
+                            # responses keep their original representation.
+                            fetched = copy.deepcopy(fetched)
+                            fetched["data"]["role_info"]["role_id"] = alias
+                    return fetched
+                async def fetch_history(**query):
+                    return await self._run_serialized_tuilan_query(
+                        'match_history', 'foreground_recovery', self.match_history_client.get_mine_match_history,
+                        **query, size=20, cursor=0)
 
-                def fetch_indicator(**query: Any) -> Any:
-                    return self.role_indicator_fetcher(
-                        query["role_id"], query["zone"], query["server"],
-                        tuilan_request=self.tuilan_request, rank=None, name=name,
+                async def fetch_replay(**query):
+                    if self.match_replay_client is None:
+                        return {}
+                    return await self._run_serialized_tuilan_query(
+                        'match_replay', 'foreground_recovery', self.match_replay_client.get_match_replay, **query)
+
+                # A sync fallback owner retains both its endpoint lock and the
+                # recovery permit until the physical thread returns.
+                for callback in (fetch_indicator, fetch_history, fetch_replay):
+                    callback.retain_physical_owner = self.foreground_client is None
+                    callback.physical_owners = (self.query_context.recovery_physical_owners
+                                                if self.query_context is not None else set())
+                with query_stage("recovery"):
+                    recovery = await recover_query_ids(
+                        snapshot, identity_repo=self._role_identity_repo(), candidates=candidates,
+                        indicator_fetcher=fetch_indicator,
+                        replay_fetcher=fetch_replay, history_fetcher=fetch_history, publish=True,
+                        deadline_seconds=min(15.0, self.query_context.remaining()) if self.query_context else 15.0,
                     )
-
-                recovery = await recover_query_ids(
-                    raw_identity, identity_repo=self._role_identity_repo(), candidates=candidates,
-                    indicator_fetcher=fetch_indicator,
-                    replay_fetcher=(self.match_replay_client.get_match_replay if self.match_replay_client else lambda **_: {}),
-                    history_fetcher=self.match_history_client.get_mine_match_history,
-                    publish=True,
-                )
+                if self.query_context is not None:
+                    self.query_context.check()
+                if recovery.get('error_code'):
+                    if recovery['error_code'] == 'indicator_query_busy':
+                        return await refresh_failed('indicator_query_busy')
+                    raise ForegroundQueryTimeout()
+                if recovery.get('status') in {'unresolved', 'conflict'}:
+                    if self.query_context is not None:
+                        self.query_context.identity_recovery_failed = True
+                    return {'error': True, 'message': 'indicator_identity_conflict', 'identity': identity}
                 if recovery.get("status") == "busy":
-                    return {"error": True, "message": "indicator_recovery_busy", "identity": identity}
+                    return await refresh_failed('indicator_query_busy')
                 if recovery.get("status") in {"healthy", "recovered"}:
-                    if recovery.get("status") == "recovered":
-                        raw_identity = recovery["identity"]
-                        identity = self._serialize_identity(raw_identity)
+                    snapshot = copy.deepcopy(recovery["identity"])
+                    identity = self._serialize_identity(snapshot)
+                    query_id, query_zone = identity.get("game_role_id"), identity.get("zone")
                     raw = recovery["raw"]
-                    resolved_game_role_id = identity.get("game_role_id")
-                    resolved_zone = identity.get("zone")
+            except (ForegroundQueryError, ForegroundMongoFailure):
+                raise
             except Exception as exc:
-                logger.warning("JJC identity recovery failed: {}", exc)
-        if not resolved_game_role_id or not resolved_zone:
+                logger.warning('JJC identity recovery failed: {}', type(exc).__name__)
+        if not query_id or not query_zone:
             return {"error": True, "message": "indicator_params_missing", "identity": identity}
-        if not isinstance(raw, dict):
-            return {"error": True, "message": "indicator_unavailable", "identity": identity}
-        if raw.get("error"):
-            return {"error": True, "message": "indicator_unavailable", "identity": identity}
-
+        if not isinstance(raw, dict) or raw.get("error"):
+            return await refresh_failed("indicator_unavailable")
         parsed = _parse_3v3_indicator(raw)
         if parsed.get("error"):
-            return {
-                "error": True,
-                "message": parsed.get("error") or "indicator_parse_failed",
-                "identity": identity,
-                "raw": raw,
-            }
-
-        if (raw_identity is not None or identity.get("global_id")) and not indicator_matches_request(
-            identity, raw, role_id=resolved_game_role_id, zone=resolved_zone, server=server,
-        ):
-            return {"error": True, "message": "indicator_identity_conflict", "identity": identity}
-
-        person_id = _extract_person_id_from_indicator(raw)
-        raw_role_info = (raw.get("data") or {}).get("role_info") if isinstance(raw.get("data"), dict) else None
-        if not isinstance(raw_role_info, dict):
-            raw_role_info = {}
-        indicator_global_role_id = _pick_str(
-            raw_role_info.get("global_role_id"),
-            raw_role_info.get("globalRoleId"),
-            identity.get("global_role_id"),
-        )
-        indicator_role_id = _pick_str(
-            raw_role_info.get("role_id"),
-            raw_role_info.get("roleId"),
-            identity.get("role_id"),
-            resolved_game_role_id,
-        )
-        if indicator_global_role_id:
-            try:
-                updated_identity = await _maybe_await(
-                    self.kungfu_cache_repo.upsert_role_identity_from_indicator(
-                        server=server,
-                        name=name,
-                        zone=resolved_zone,
-                        game_role_id=resolved_game_role_id,
-                        global_role_id=indicator_global_role_id,
-                        role_id=indicator_role_id,
-                        person_id=person_id,
-                        global_id=_pick_str(identity.get("global_id")),
-                    )
-                )
-                if isinstance(updated_identity, dict):
-                    identity = updated_identity
-                    identity_key = _pick_str(updated_identity.get("identity_key")) or identity_key
-            except Exception as exc:
-                logger.warning(f"JJC 角色 indicator: 写入 role_identities 失败 server={server} name={name} error={exc}")
-
-        cached_at = time.time()
-        cache_payload = {
-            "identity_key": identity_key,
-            "server": server,
-            "name": _normalize_name(name),
-            "game_role_id": resolved_game_role_id,
-            "global_role_id": indicator_global_role_id or _pick_str(identity.get("global_role_id")),
-            "global_id": _pick_str(identity.get("global_id")),
-            "role_id": indicator_role_id or _pick_str(identity.get("role_id")),
-            "person_id": person_id,
-            "zone": resolved_zone,
-            "indicator": parsed,
-            "raw": raw,
-            "cached_at": cached_at,
-        }
-        if raw_identity is not None and raw_identity.get("_id") is not None:
-            latest = await self._role_identity_repo().get_by_id(raw_identity["_id"])
-            if not isinstance(latest, dict) or any(
-                latest.get(key) != raw_identity.get(key)
-                for key in ("identity_key", "global_id", "global_role_id", "game_role_id", "role_id", "server", "zone", "name")
-            ):
-                return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+            failure = await refresh_failed(parsed.get("error") or "indicator_parse_failed")
+            if failure.get("error"):
+                failure["raw"] = raw
+            return failure
         try:
-            await self.cache_repo.save_role_indicator(identity_key, cache_payload)
-            saved = await self.cache_repo.load_role_indicator(identity_key, ttl_seconds=self.role_indicator_ttl_seconds)
-            if not saved or saved.get("cached_at") != cached_at:
+            lock = await self._acquire_query_lock('indicator_publication')
+        except ForegroundQueryBusy:
+            return await refresh_failed('indicator_query_busy')
+        try:
+            if not self._indicator_matches_identity(identity, raw, role_id=query_id, zone=query_zone,
+                                                    server=server, allowed_names=allowed_names, request_hints=hints):
+                return {"error": True, "message": "indicator_identity_conflict", "identity": identity}
+            # Check before the ordinary upsert: it must not overwrite query IDs that
+            # a separately verified recovery changed while this HTTP call was in flight.
+            if snapshot and not await self._identity_snapshot_is_current(snapshot):
+                return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+            info = raw["data"]["role_info"]
+            actual_name = _pick_str(info.get("name")) or name
+            person_id = _extract_person_id_from_indicator(raw)
+            if not resolution.get("identity_published"):
+                try:
+                    updated = await _maybe_await(self.kungfu_cache_repo.upsert_role_identity_from_indicator(
+                        server=server, name=actual_name, zone=query_zone, game_role_id=query_id,
+                        global_role_id=_pick_str(info.get("global_role_id"), info.get("globalRoleId"), identity.get("global_role_id")),
+                        role_id=_pick_str(info.get("role_id"), info.get("roleId"), query_id),
+                        person_id=person_id, global_id=_pick_str((snapshot or {}).get("global_id")), preserve_id=True,
+                    ))
+                except Exception as exc:
+                    logger.warning("JJC indicator identity write failed: {}", exc)
+                    return {"error": True, "message": "indicator_storage_unavailable", "identity": identity}
+                if not isinstance(updated, dict) or not updated:
+                    return {"error": True, "message": "indicator_storage_unavailable", "identity": identity}
+                snapshot = copy.deepcopy(updated)
+            if not snapshot or not self._indicator_matches_identity(snapshot, raw, role_id=query_id,
+                        zone=query_zone, server=server,
+                        allowed_names=(_pick_str(snapshot.get("name")) or name,), request_hints=hints):
+                return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+            identity = self._serialize_identity(snapshot)
+            identity_key = _pick_str(snapshot.get("identity_key"))
+            name = _pick_str(snapshot.get("name")) or actual_name
+            cached_at = time.time()
+            payload = {**identity_binding(snapshot), "person_id": person_id,
+                       "indicator": parsed, "raw": copy.deepcopy(raw), "cached_at": cached_at}
+            query_cache(key_type="canonical")
+            scope = self._role_indicator_scope()
+            if scope is not None:
+                payload["scope"] = scope
+            if not identity_key or not indicator_binding_matches(snapshot, payload):
+                return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+            if not await self._identity_snapshot_is_current(snapshot):
+                return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+            try:
+                await self.cache_repo.save_role_indicator(identity_key, payload, strict=True)
+                saved = await self.cache_repo.load_role_indicator(identity_key,
+                    ttl_seconds=self.role_indicator_ttl_seconds, strict=True)
+                if not await self._identity_snapshot_is_current(snapshot):
+                    return {"error": True, "message": "indicator_identity_changed", "identity": identity}
+                if (not saved or saved.get("cached_at") != cached_at or saved.get("raw") != raw
+                        or not indicator_binding_matches(snapshot, saved)):
+                    return {"error": True, "message": "indicator_cache_write_failed", "identity": identity}
+            except Exception as exc:
+                logger.warning("JJC indicator cache publication failed: {}", exc)
                 return {"error": True, "message": "indicator_cache_write_failed", "identity": identity}
-        except Exception as exc:
-            logger.warning("JJC indicator cache write failed: {}", exc)
-            return {"error": True, "message": "indicator_cache_write_failed", "identity": identity}
+            return {"player": {"server": server, "name": name}, "identity": identity,
+                    "indicator": parsed, "raw": raw,
+                    "cache": {"hit": False, "cached_at": cached_at, "ttl_seconds": self.role_indicator_ttl_seconds,
+                              "force_refresh": bool(force_refresh), "stale": False, "age_seconds": indicator_cache_age(cached_at, time.time())}}
 
-        return {
-            "player": {"server": server, "name": _normalize_name(name)},
-            "identity": identity,
-            "indicator": parsed,
-            "raw": raw,
-            "cache": {
-                "hit": False,
-                "cached_at": cached_at,
-                "ttl_seconds": self.role_indicator_ttl_seconds,
-                "force_refresh": bool(force_refresh),
-            },
-        }
+        finally:
+            lock.release()
 
-    async def _resolve_role_identity(
+    @observed_query_stage("identity")
+    async def _resolve_role_identity(self, *, server, name, identity_hints):
+        if self.query_context is None:
+            return await self._resolve_role_identity_once(server=server, name=name, identity_hints=identity_hints)
+        kwargs = dict(server=server, name=name, identity_hints=identity_hints,
+                      force_refresh=getattr(self.query_context, 'force_refresh', False))
+        local = getattr(self.query_context, 'local_identity', None)
+        key = self._foreground_key('identity', kwargs, local)
+        async def resolve(context):
+            context.force_refresh = getattr(self.query_context, 'force_refresh', False)
+            context.local_identity = copy.deepcopy(local)
+            return await self._execute_foreground('identity',
+                dict(server=server, name=name, identity_hints=identity_hints), context, prepare=False)
+        return await foreground_flights().run(key, self.query_context, resolve)
+
+    async def _resolve_role_identity_once(
         self,
         *,
         server: str,
         name: str,
         identity_hints: dict[str, Any],
     ) -> dict[str, Any]:
-        """按优先级解析角色身份：role_identities → role_jjc_cache → live ranking。"""
-        display_name = _normalize_name(name)
-        hint_global_id = _pick_str(identity_hints.get("global_id"))
-        hint_global_role_id = _pick_str(identity_hints.get("global_role_id"))
-        hint_role_id = _pick_str(identity_hints.get("role_id"))
-        hint_game_role_id = _pick_str(identity_hints.get("game_role_id"))
-        hint_zone = _pick_str(identity_hints.get("zone"))
+        """Resolve an exact stored name before one display-suffix candidate.
 
-        # ---- 1. 前端直接传入 global_role_id ----
-        if hint_global_role_id:
-            logger.info("JJC 角色标识解析: 直接使用前端传入 global_role_id server={} name={}", server, name)
-            identity_key = f"global_id:{hint_global_id}" if hint_global_id else f"global:{hint_global_role_id}"
-            return {
-                "server": server,
-                "name": display_name,
-                "global_role_id": hint_global_role_id,
-                "global_id": hint_global_id,
-                "role_id": hint_role_id,
-                "game_role_id": hint_game_role_id or hint_role_id,
-                "zone": hint_zone,
-                "source": "detail_hint_global_role_id",
-                "identity_key": identity_key,
+        Repository fallback after an unknown hint is not proof that the hint
+        belongs to the named role; compare every nonempty hint before reuse.
+        """
+        server, name = str(server or "").strip(), _normalize_name(name)
+        candidates = role_name_candidates(server, name)
+        for candidate in candidates:
+            if self.query_context is not None and hasattr(self.query_context, 'local_identity'):
+                identity = self.query_context.local_identity if candidate == candidates[0] else None
+            else:
+                identity = await _maybe_await(self.kungfu_cache_repo.resolve_role_identity(
+                    server=server, name=candidate,
+                    **local_lookup_hints(identity_hints), preserve_id=True,
+                ))
+            if not isinstance(identity, dict) or not identity:
+                continue
+            if identity_hints_conflict(identity, server, identity_hints):
+                return {"error": True, "message": "indicator_identity_conflict"}
+            stored_identity = copy.deepcopy(identity)
+            # Hints may fill missing query locators only after known fields
+            # agree. Keep this request-local; raw identity validation still
+            # precedes publication, and stored strong IDs remain authoritative.
+            identity = dict(identity)
+            query_id = _pick_str(
+                identity.get("game_role_id"), identity.get("role_id"),
+                identity_hints.get("game_role_id"), identity_hints.get("role_id"),
+            )
+            identity["game_role_id"] = _pick_str(identity.get("game_role_id"), query_id)
+            identity["role_id"] = _pick_str(identity.get("role_id"), query_id)
+            identity["zone"] = _pick_str(identity.get("zone"), identity_hints.get("zone"))
+            canonical = _pick_str(identity.get("name")) or candidate
+            if _pick_str(identity.get("global_role_id")):
+                result = self._serialize_identity(identity)
+                result.update(server=server, name=canonical, source="role_identity_name_match")
+                return self._resolution_packet(result, (canonical,), snapshot=stored_identity)
+            # The name is now confirmed; helpers must not strip it again.
+            confirmed_hints = {
+                key: value for key, value in identity.items()
+                if key in ("global_id", "global_role_id", "game_role_id", "role_id", "zone") and value
             }
-
-        # ---- 2. 有 game_role_id + zone → 先查 role_identities，再走 indicator 补 global ----
-        if hint_game_role_id and hint_zone:
-            identity = await self.kungfu_cache_repo.resolve_role_identity(
-                server=server,
-                name=name,
-                zone=hint_zone,
-                game_role_id=hint_game_role_id,
-                global_id=hint_global_id,
-            )
-            if identity:
-                gid = _pick_str(identity.get("global_role_id"))
-                if gid:
-                    logger.info("JJC 角色标识解析: 使用 role_identities (hints) server={} name={}", server, name)
-                    return {
-                        "server": server,
-                        "name": display_name,
-                        "global_role_id": gid,
-                        "global_id": _pick_str(identity.get("global_id")) or hint_global_id,
-                        "role_id": _pick_str(identity.get("role_id")) or hint_role_id,
-                        "game_role_id": _pick_str(identity.get("game_role_id")) or hint_game_role_id,
-                        "zone": _pick_str(identity.get("zone")) or hint_zone,
-                        "source": "role_identity_hint_match",
-                        "identity_key": identity.get("identity_key") or f"global:{gid}",
-                    }
-            identity = await self._resolve_identity_from_indicator(
-                server=server,
-                name=name,
-                game_role_id=hint_game_role_id,
-                zone=hint_zone,
-                role_id=hint_role_id,
-                global_id=hint_global_id,
-                source="detail_hint_game_role_id",
-            )
-            if identity:
-                return identity
-
-        # ---- 3. 查 role_identities 按 server + name ----
-        identity = await self.kungfu_cache_repo.resolve_role_identity(
-            server=server,
-            name=name,
-            global_id=hint_global_id,
-        )
-        if identity:
-            gid = _pick_str(identity.get("global_role_id"))
-            if gid:
-                logger.info("JJC 角色标识解析: 使用 role_identities (name) server={} name={}", server, name)
-                return {
-                    "server": server,
-                    "name": display_name,
-                    "global_role_id": gid,
-                    "global_id": _pick_str(identity.get("global_id")) or hint_global_id,
-                    "role_id": _pick_str(identity.get("role_id")),
-                    "game_role_id": _pick_str(identity.get("game_role_id")),
-                    "zone": _pick_str(identity.get("zone")),
-                    "source": "role_identity_name_match",
-                    "identity_key": identity.get("identity_key") or f"global:{gid}",
-                }
-            z = _pick_str(identity.get("zone"))
-            grid = _pick_str(identity.get("game_role_id"))
-            if z and grid:
-                identity_result = await self._resolve_identity_from_indicator(
-                    server=server,
-                    name=name,
-                    game_role_id=grid,
-                    zone=z,
+            confirmed_hints.update({key: value for key, value in identity_hints.items() if value})
+            query_id = _pick_str(identity.get("game_role_id"), identity.get("role_id"))
+            query_zone = _pick_str(identity.get("zone"))
+            result = None
+            if query_id and query_zone:
+                result = await self._resolve_identity_from_indicator(
+                    server=server, name=canonical, game_role_id=query_id, zone=query_zone,
                     role_id=_pick_str(identity.get("role_id")),
-                    global_id=_pick_str(identity.get("global_id")) or hint_global_id,
-                    source="role_identity_indicator",
+                    global_id=_pick_str(identity.get("global_id")), source="role_identity_indicator",
+                    allowed_names=(canonical,), identity_hints=confirmed_hints,
+                    identity_snapshot=stored_identity,
                 )
-                if identity_result:
-                    return identity_result
-
-        # ---- 4. 查新缓存 role_jjc_cache 中的身份字段 ----
-        jjc_cache = await self.kungfu_cache_repo.load_new_kungfu_cache_raw(
-            server=server,
-            name=name,
+            if result is None:
+                # A known identity is never replaced by another name after IO fails.
+                return {"error": True, "message": "indicator_unavailable",
+                        "identity": self._serialize_identity(identity)}
+            return self._resolution_packet(result, (canonical,))
+        result = await self._resolve_role_identity_fallback(
+            server=server, name=name, identity_hints=identity_hints,
+            allowed_names=candidates,
         )
-        if jjc_cache:
-            cache_global_role_id = _pick_str(jjc_cache.get("global_role_id"))
-            cache_global_id = _pick_str(jjc_cache.get("global_id")) or hint_global_id
-            cache_game_role_id = _pick_str(jjc_cache.get("game_role_id"))
-            cache_zone = _pick_str(jjc_cache.get("zone"))
-            cache_role_id = _pick_str(jjc_cache.get("role_id"))
-            if cache_global_role_id:
-                logger.info("JJC 角色标识解析: 使用新缓存 global_role_id server={} name={}", server, name)
-                return {
-                    "server": server,
-                    "name": display_name,
-                    "global_role_id": cache_global_role_id,
-                    "global_id": cache_global_id,
-                    "role_id": cache_role_id,
-                    "game_role_id": cache_game_role_id or cache_role_id,
-                    "zone": cache_zone,
-                    "source": "new_cache_global_role_id",
-                    "identity_key": jjc_cache.get("identity_key") or f"global:{cache_global_role_id}",
-                }
-            if cache_game_role_id and cache_zone:
-                identity = await self._resolve_identity_from_indicator(
-                    server=server,
-                    name=name,
-                    game_role_id=cache_game_role_id,
-                    zone=cache_zone,
-                    role_id=cache_role_id,
-                    global_id=cache_global_id,
-                    source="new_cache_game_role_id",
+        return self._resolution_packet(result, candidates)
+
+    async def _resolve_role_identity_fallback(
+        self, *, server: str, name: str, identity_hints: dict[str, Any],
+        allowed_names: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Discover a missing locator; never repeat local lookup or name inference."""
+        hint_global_id = _pick_str(identity_hints.get("global_id"))
+        hint_sk01 = _pick_str(identity_hints.get("global_role_id"))
+        hint_id = _pick_str(identity_hints.get("game_role_id"), identity_hints.get("role_id"))
+        hint_zone = _pick_str(identity_hints.get("zone"))
+        if hint_sk01:
+            # History can use an explicit SK01 without a query ID. Indicator IO
+            # validates the actual role_info before any publication.
+            return {"server": server, "name": name, "global_role_id": hint_sk01,
+                    "global_id": hint_global_id, "role_id": hint_id,
+                    "game_role_id": hint_id, "zone": hint_zone,
+                    "source": "detail_hint_global_role_id",
+                    "identity_key": f"global_id:{hint_global_id}" if hint_global_id else f"global:{hint_sk01}"}
+        if hint_id and hint_zone:
+            result = await self._resolve_identity_from_indicator(
+                server=server, name=name, game_role_id=hint_id, zone=hint_zone,
+                role_id=hint_id, global_id=hint_global_id, source="detail_hint_game_role_id",
+                allowed_names=allowed_names, identity_hints=identity_hints,
+            )
+            if result is not None:
+                return result
+            # An explicit failed locator is not permission to try another role.
+            return {"error": True, "message": "role_identity_not_found"}
+
+        for candidate in allowed_names:
+            cached = await _maybe_await(self.kungfu_cache_repo.load_new_kungfu_cache_raw(
+                server=server, name=candidate,
+            ))
+            if not isinstance(cached, dict) or not cached:
+                continue
+            if identity_hints_conflict(cached, server, identity_hints):
+                return {"error": True, "message": "indicator_identity_conflict"}
+            cached_name = _pick_str(cached.get("name")) or candidate
+            if cached_name not in allowed_names:
+                continue
+            sk01 = _pick_str(cached.get("global_role_id"))
+            query_id = _pick_str(cached.get("game_role_id"), cached.get("role_id"))
+            query_zone = _pick_str(cached.get("zone"))
+            numeric = hint_global_id  # request constraint, never a cache-derived identity fact
+            if sk01:
+                return {"server": server, "name": cached_name, "global_role_id": sk01,
+                        "global_id": numeric, "role_id": query_id, "game_role_id": query_id,
+                        "zone": query_zone, "source": "new_cache_global_role_id",
+                        "identity_key": cached.get("identity_key") or f"global:{sk01}"}
+            if query_id and query_zone:
+                result = await self._resolve_identity_from_indicator(
+                    server=server, name=cached_name, game_role_id=query_id, zone=query_zone,
+                    role_id=query_id, global_id=numeric, source="new_cache_game_role_id",
+                    allowed_names=allowed_names, identity_hints=identity_hints,
                 )
-                if identity:
-                    return identity
+                if result is not None:
+                    return result
 
-        # ---- 5. 实时排行榜查询 ----
-        async with self._get_tuilan_query_lock("live_ranking"):
-            ranking_result = await self.ranking_service.query_jjc_ranking()
-        if not ranking_result.get("error") and ranking_result.get("code") == 0:
-            for player in ranking_result.get("data", []):
-                if not isinstance(player, dict):
+        lock = await self._acquire_query_lock('live_ranking')
+        try:
+            ranking = await self.ranking_service.query_jjc_ranking_raw()
+        finally:
+            owners = self.query_context.recovery_physical_owners if self.query_context else ()
+            release_after_owners(lock.release, owners)
+        if not ranking.get("error") and ranking.get("code") == 0:
+            for canonical, person in ranking_name_matches(
+                server, name, ranking.get("data", []), allowed_names=allowed_names,
+            ):
+                sk01 = _pick_str(person.get("globalRoleId"))
+                query_id = _pick_str(person.get("gameRoleId"))
+                query_zone = _pick_str(person.get("zone"))
+                numeric = _pick_str(person.get("globalId"))
+                locator = {"server": server, "zone": query_zone, "game_role_id": query_id,
+                           "role_id": query_id, "global_role_id": sk01, "global_id": numeric}
+                if identity_hints_conflict(locator, server, identity_hints):
                     continue
-                person_info = player.get("personInfo", {}) or {}
-                player_server = _pick_str(person_info.get("server"))
-                player_name = _normalize_name(_pick_str(person_info.get("roleName")))
-                if player_server != server or player_name != display_name:
-                    continue
-                ranking_global_role_id = _pick_str(person_info.get("globalRoleId"))
-                ranking_game_role_id = _pick_str(person_info.get("gameRoleId"))
-                ranking_zone = _pick_str(person_info.get("zone"))
-                if ranking_global_role_id:
-                    logger.info("JJC 角色标识解析: 使用实时榜单 global_role_id server={} name={}", server, name)
-                    return {
-                        "server": server,
-                        "name": display_name,
-                        "global_role_id": ranking_global_role_id,
-                        "role_id": ranking_game_role_id,
-                        "game_role_id": ranking_game_role_id,
-                        "zone": ranking_zone,
-                        "source": "live_ranking_global_role_id",
-                        "identity_key": f"global:{ranking_global_role_id}",
-                    }
-                if ranking_game_role_id and ranking_zone:
-                    identity = await self._resolve_identity_from_indicator(
-                        server=server,
-                        name=name,
-                        game_role_id=ranking_game_role_id,
-                        zone=ranking_zone,
-                        role_id=ranking_game_role_id,
-                        global_id=None,
-                        source="live_ranking_game_role_id",
+                if sk01:
+                    return {**locator, "name": canonical, "source": "live_ranking_global_role_id",
+                            "identity_key": f"global_id:{numeric}" if numeric else f"global:{sk01}"}
+                if query_id and query_zone:
+                    result = await self._resolve_identity_from_indicator(
+                        server=server, name=canonical, game_role_id=query_id, zone=query_zone,
+                        role_id=query_id, global_id=numeric, source="live_ranking_game_role_id",
+                        allowed_names=(canonical,), identity_hints=identity_hints,
                     )
-                    if identity:
-                        return identity
-
-        logger.warning("JJC 角色标识解析失败: server={} name={} hints={}", server, name, identity_hints)
-        return {"error": True, "message": "role_identity_not_found", "server": server, "name": display_name}
+                    if result is not None:
+                        return result
+                    break
+        return {"error": True, "message": "role_identity_not_found", "server": server, "name": name}
 
     async def _resolve_identity_from_indicator(
         self,
@@ -1148,6 +1539,9 @@ class JjcRankingInspectService:
         role_id: Optional[str],
         global_id: Optional[str],
         source: str,
+        allowed_names: Optional[tuple[str, ...]] = None,
+        identity_hints: Optional[dict[str, Any]] = None,
+        identity_snapshot: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         logger.info(
             "JJC 角色标识解析: 调用 indicator 补全标识 server={} name={} game_role_id={} zone={} source={}",
@@ -1157,6 +1551,7 @@ class JjcRankingInspectService:
             zone,
             source,
         )
+        requested_at = time.monotonic()
         result = await self._run_serialized_tuilan_query(
             "role_indicator",
             f"role_indicator:{server}:{name}",
@@ -1170,9 +1565,22 @@ class JjcRankingInspectService:
         )
         if not isinstance(result, dict):
             return None
-        role_info = (result.get("data") or {}).get("role_info") or {}
+        if result.get("error") or result.get("code") not in (0, None):
+            return None
+        data = result.get("data")
+        role_info = data.get("role_info") if isinstance(data, dict) else None
+        if not isinstance(role_info, dict):
+            return None
+        resolved_name = _pick_str(role_info.get("name")) or name
+        if resolved_name not in (allowed_names if allowed_names is not None else (name,)):
+            return None
         global_role_id = _pick_str(role_info.get("global_role_id"), role_info.get("globalRoleId"))
         resolved_role_id = _pick_str(role_info.get("role_id"), role_info.get("roleId"), role_id, game_role_id)
+        wanted = {**(identity_hints or {}), "game_role_id": game_role_id,
+                  "role_id": role_id or game_role_id, "zone": zone}
+        actual = {**role_info, "role_id": resolved_role_id, "global_role_id": global_role_id}
+        if identity_hints_conflict(actual, server, wanted):
+            return None
         person_id = _extract_person_id_from_indicator(result)
         if not global_role_id:
             logger.warning(
@@ -1182,32 +1590,43 @@ class JjcRankingInspectService:
                 source,
             )
             return None
+        if identity_snapshot and not await self._identity_snapshot_is_current(identity_snapshot):
+            return {"error": True, "message": "indicator_identity_changed"}
+        # Neither an old profile cache nor a caller hint is numeric identity
+        # proof. Recheck independently using the physically validated locator/SK01.
+        authoritative = await _maybe_await(self.kungfu_cache_repo.resolve_role_identity(
+            server=server, name=resolved_name, zone=zone, game_role_id=game_role_id,
+            global_role_id=global_role_id, preserve_id=True,
+        ))
+        established_numeric = None
+        if isinstance(authoritative, dict) and authoritative:
+            locator = {"zone": zone, "game_role_id": game_role_id,
+                       "role_id": resolved_role_id, "global_role_id": global_role_id}
+            if (identity_hints_conflict(authoritative, server, locator)
+                    or identity_hints_conflict(authoritative, server, identity_hints or {})):
+                return {"error": True, "message": "indicator_identity_conflict"}
+            established_numeric = _pick_str(authoritative.get("global_id"))
         try:
-            await _maybe_await(
-                self.kungfu_cache_repo.upsert_role_identity_from_indicator(
-                    server=server,
-                    name=name,
-                    zone=zone,
-                    game_role_id=game_role_id,
-                    global_role_id=global_role_id,
-                    role_id=resolved_role_id,
-                    person_id=person_id,
-                    global_id=global_id,
-                )
-            )
+            updated = await _maybe_await(self.kungfu_cache_repo.upsert_role_identity_from_indicator(
+                server=server, name=resolved_name, zone=zone, game_role_id=game_role_id,
+                global_role_id=global_role_id, role_id=resolved_role_id, person_id=person_id,
+                global_id=established_numeric, preserve_id=True,
+            ))
         except Exception as exc:
-            logger.warning(f"JJC 角色标识解析: 写入 role_identities 失败 server={server} name={name} error={exc}")
+            logger.warning("JJC identity completion write failed: {}", exc)
+            return {"error": True, "message": "indicator_storage_unavailable"}
+        if not isinstance(updated, dict) or not updated:
+            return {"error": True, "message": "indicator_storage_unavailable"}
+        if (identity_hints_conflict(updated, server, wanted)
+                or identity_hints_conflict(actual, server, updated)
+                or _pick_str(updated.get("name")) != resolved_name):
+            return {"error": True, "message": "indicator_identity_changed"}
         return {
-            "server": server,
-            "name": _normalize_name(name),
-            "global_role_id": global_role_id,
-            "global_id": global_id,
-            "role_id": resolved_role_id,
-            "person_id": person_id,
-            "game_role_id": game_role_id,
-            "zone": zone,
-            "source": source,
-            "identity_key": f"global_id:{global_id}" if global_id else f"global:{global_role_id}",
+            "identity": copy.deepcopy(updated), "identity_snapshot": copy.deepcopy(updated),
+            "indicator_raw": copy.deepcopy(result),
+            "indicator_request": {"role_id": game_role_id, "zone": zone, "server": server,
+                                  "requested_at": requested_at},
+            "identity_source": source, "identity_published": True,
         }
 
     async def _build_role_recent_payload(self, *, server: str, name: str, identity: dict[str, Any], cursor: int = 0) -> dict[str, Any]:

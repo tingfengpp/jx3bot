@@ -2,12 +2,14 @@
 
 import asyncio
 import copy
+import inspect
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 from src.services.jx3.indicator_utils import parse_3v3_indicator
+from src.services.jx3.jjc_role_query_context import release_after_owners
 from src.services.jx3.role_identity_matching import validate_query_id_evidence
 
 
@@ -101,17 +103,42 @@ async def recover_query_ids(
         remaining = deadline - time.monotonic()
         if remaining <= 0 or calls >= limit:
             raise TimeoutError("recovery_deadline_or_budget")
+        asynchronous = inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(getattr(func, '__call__', None))
+        if asynchronous:
+            async def invoke_async():
+                nonlocal calls
+                # Acquire in the executing owner, immediately before its try.
+                # A task cancelled before its first step never owns a permit.
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('recovery_deadline')
+                if not _HTTP_PERMIT.acquire(blocking=False):
+                    raise TimeoutError('recovery_http_busy')
+                calls += 1
+                try:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('recovery_deadline')
+                    return await func(**kwargs)
+                finally:
+                    # Frontend exit cannot relinquish a still-closing socket.
+                    release_after_owners(_HTTP_PERMIT.release, getattr(func, 'physical_owners', ()))
+            task = asyncio.create_task(invoke_async())
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            if getattr(func, 'retain_physical_owner', False):
+                # The service callback itself owns the sync endpoint until real
+                # completion; cancellation of its waiter must not free permit.
+                return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            return await asyncio.wait_for(task, timeout=remaining)
+
         if not _HTTP_PERMIT.acquire(blocking=False):
-            raise TimeoutError("recovery_http_busy")
+            raise TimeoutError('recovery_http_busy')
         calls += 1
 
         def invoke() -> Any:
             try:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("recovery_deadline")
+                    raise TimeoutError('recovery_deadline')
                 return func(**kwargs)
             finally:
-                # Cancellation of an await does not cancel a requests HTTP thread.
                 _HTTP_PERMIT.release()
 
         task = asyncio.create_task(asyncio.to_thread(invoke))
@@ -202,4 +229,5 @@ async def recover_query_ids(
     except Exception as exc:
         if isinstance(exc, TimeoutError) and str(exc) == "recovery_http_busy":
             return outcome("busy", reason="recovery_http_busy")
-        return outcome("upstream_error", reason=type(exc).__name__, upstream_error_data={"error": str(exc)})
+        return outcome('upstream_error', reason=type(exc).__name__, error_code=getattr(exc, 'code', None),
+                       upstream_error_data={'error': str(exc)})

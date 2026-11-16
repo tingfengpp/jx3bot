@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+import time
 
 import config as cfg
 from jinja2 import Environment, FileSystemLoader
 
 from src.infra.jx3api_get import get
+from src.infra.tuilan_foreground_client import TuilanForegroundClient
 from src.storage.mongo_repos.group_config_repo import GroupConfigRepo
 from src.services.jx3.jjc_ranking_inspect import JjcRankingInspectService
 from src.services.jx3.jjc_ranking import JjcRankingService
@@ -87,17 +89,60 @@ from src.infra.tuilan_kungfu_client import TuilanKungfuClient
 from src.services.jx3.jjc_kungfu_policy import policy_from_config
 from src.services.jx3.jjc_kungfu_refresh import JjcKungfuRefreshService
 from src.storage.mongo_repos.jjc_kungfu_refresh_repo import JjcKungfuRefreshRepo
+from src.storage.mongo_repos.jjc_ranking_stats_repo import JjcRankingStatsRepo
+from src.services.jx3.jjc_ranking_display import JjcRankingDisplayService
 
 jjc_kungfu_refresh_repo = JjcKungfuRefreshRepo()
 jjc_kungfu_refresh_service = JjcKungfuRefreshService(
     identity_repo=role_identity_repo,
     queue_repo=jjc_kungfu_refresh_repo,
-    client=TuilanKungfuClient(),
+    client=TuilanKungfuClient(display_enabled=getattr(cfg, "JJC_RANKING_DISPLAY_QUERY_ENABLED", 0) == 1),
     policy=policy_from_config,
     mapping=KUNGFU_PINYIN_TO_CHINESE,
 )
 
+jjc_ranking_display_service = JjcRankingDisplayService(
+    stats_repo=JjcRankingStatsRepo(suppress_errors=False),
+    identity_repo=role_identity_repo,
+    policy=policy_from_config,
+    enabled=lambda: getattr(cfg, "JJC_RANKING_DISPLAY_OVERLAY_ENABLED", 0) == 1,
+    clock=time.time,
+)
+
+# Equipment reads own a lazy bounded pool; frozen compatibility reads use the
+# ordinary stats repository so disabling new aggregation never hides schema2.
+from src.infra.jjc_equipment_read_runtime import EquipmentReadRuntime
+from src.services.jx3.jjc_ranking_equipment_view import JjcRankingEquipmentViewService
+
+jjc_equipment_read_runtime = EquipmentReadRuntime(
+    enabled=lambda: getattr(cfg, "JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED", 0) == 1,
+    uri=cfg.MONGO_URI,
+    host_override=getattr(cfg, "JJC_EQUIPMENT_MONGO_HOST", ""),
+)
+
+
+class _EquipmentReadDatabase:
+    def __getattr__(self, name):
+        return getattr(jjc_equipment_read_runtime.get_db(), name)
+
+    def __getitem__(self, name):
+        return self.__getattr__(name)
+
+
+_equipment_db = _EquipmentReadDatabase()
+jjc_ranking_equipment_service = JjcRankingEquipmentViewService(
+    stats_repo=JjcRankingStatsRepo(suppress_errors=False),
+    dynamic_stats_repo=JjcRankingStatsRepo(db=_equipment_db, suppress_errors=False),
+    identity_repo=RoleIdentityRepo(db=_equipment_db),
+    inspect_repo=JjcInspectRepo(db=_equipment_db, snapshot_repo=JjcMatchSnapshotRepo(db=_equipment_db), participant_repo=None),
+    snapshot_repo=JjcMatchSnapshotRepo(db=_equipment_db),
+    scope=policy_from_config,
+    enabled=lambda: getattr(cfg, "JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED", 0) == 1,
+    overlay_enabled=lambda: getattr(cfg, "JJC_RANKING_DISPLAY_OVERLAY_ENABLED", 0) == 1,
+)
+
 jjc_ranking_service = JjcRankingService(
+    equipment_service=jjc_ranking_equipment_service,
     token=cfg.TOKEN,
     ticket=cfg.TICKET,
     jjc_query_url=cfg.API_URLS["竞技查询"],
@@ -150,7 +195,18 @@ role_indicator_client = RoleIndicatorClient(
 )
 
 
+# Assembly only: clients remain loop-local and lazy until application lifecycle.
+jjc_foreground_client = TuilanForegroundClient(endpoint_urls={
+    'role_indicator': cfg.API_URLS['推栏角色指标'],
+    'match_history': cfg.API_URLS['竞技场战局历史'],
+    'arena_time_tag': cfg.API_URLS['竞技场时间查询'],
+    'arena_ranking': cfg.API_URLS['竞技场排行榜查询'],
+    'match_detail': cfg.API_URLS['竞技场战局详情'],
+    'match_replay': cfg.API_URLS['竞技场战局回放'],
+})
+
 jjc_ranking_inspect_service = JjcRankingInspectService(
+    foreground_client=jjc_foreground_client,
     ranking_service=jjc_ranking_service,
     kungfu_cache_repo=JjcCacheRepo(
         jjc_ranking_cache_duration=JJC_RANKING_CACHE_DURATION,

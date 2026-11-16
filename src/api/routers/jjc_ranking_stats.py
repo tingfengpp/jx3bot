@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import math
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Query
@@ -9,12 +10,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from nonebot import logger
 
+import config as cfg
 from config import KUNGFU_META
 from src.api.response import error_response, success_response
 from src.services.jx3.singletons import jjc_ranking_inspect_service
 from src.services.jx3.jjc_peak_score_ranking import JjcPeakScoreRankingService
+from src.services.jx3.jjc_ranking_display import DisplayRequestError, public_display_member
 from src.storage.mongo_repos.jjc_peak_score_ranking_repo import JjcPeakScoreRankingRepo
-from src.storage.mongo_repos.jjc_ranking_stats_repo import JjcRankingStatsRepo
+from src.storage.mongo_repos.jjc_ranking_stats_repo import JjcRankingStatsRepo, EquipmentSnapshotError
 from src.storage.mongo_repos.jjc_inspect_repo import JjcInspectRepo
 from src.storage.mongo_repos.jjc_match_participant_repo import JjcMatchParticipantRepo
 
@@ -34,6 +37,118 @@ _HEALER_KUNGFU_NAMES = {
     for meta in KUNGFU_META.values()
     if isinstance(meta, dict) and meta.get("category") == "healer" and meta.get("name")
 }
+
+
+
+def _equipment_enabled() -> bool:
+    return getattr(cfg, "JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED", 0) == 1
+
+
+def _equipment_overlay_enabled() -> bool:
+    return getattr(cfg, "JJC_RANKING_DISPLAY_OVERLAY_ENABLED", 0) == 1
+
+
+def _equipment_service():
+    # Legacy import harnesses and rollback code may not expose this optional
+    # assembly. Never import the application launcher or create a service here.
+    try:
+        from src.services.jx3.singletons import jjc_ranking_equipment_service
+    except ImportError:
+        return None
+    return jjc_ranking_equipment_service
+
+
+def _equipment_timestamp(value: Any) -> Optional[int]:
+    if (not isinstance(value, str) or not value or len(value) > 19
+            or not value.isascii() or not value.isdigit()):
+        return None
+    number = int(value)
+    return number if 0 < number <= 9223372036854775807 else None
+
+
+def _equipment_contract(value: Any) -> bool:
+    return isinstance(value, str) and value == "2"
+
+
+def _equipment_failure(code: str, *, data: Optional[Dict[str, Any]] = None):
+    if code in ("equipment_contract_upgrade_required", "version_mismatch"):
+        status = 409
+    elif code in ("invalid_params", "invalid_timestamp", "invalid_range", "invalid_lane"):
+        status = 400
+    elif code == "not_found":
+        status = 404
+    else:
+        code = "busy" if code == "busy" else "read_failed"
+        status = 503
+    return JSONResponse(status_code=status, content=error_response(code, data=data))
+
+
+def _public_revocations(values: Any) -> List[Dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    answer = []
+    fields = ("timestamp", "member_revision", "binding_revision", "rank", "confirmed_at", "reason")
+    for value in values[:1000]:
+        if not isinstance(value, dict) or value.get("reason") not in ("binding_invalid", "data_inconsistent", "no_local_win"):
+            continue
+        item = {k: value[k] for k in fields if k in value
+                and (value[k] is None or type(value[k]) in (str, int, float, bool))
+                and (type(value[k]) is not float or math.isfinite(value[k]))}
+        scope = value.get("scope")
+        item["scope"] = {k: scope[k] for k in ("season_id", "season_start", "pvp_type", "algorithm_version")
+                         if isinstance(scope, dict) and k in scope
+                         and type(scope[k]) in (str, int, float, bool)
+                         and (type(scope[k]) is not float or math.isfinite(scope[k]))}
+        answer.append(item)
+    return answer
+
+
+def _snapshot_read_repo():
+    if not _equipment_enabled():
+        return JjcRankingStatsRepo()
+    service = _equipment_service()
+    selector = getattr(service, "snapshot_read_repo", None)
+    if not callable(selector):
+        raise EquipmentSnapshotError("read_failed")
+    return selector()
+
+
+async def _equipment_mode(repo, timestamp: int, summary=None) -> bool:
+    """Reject cross-protocol reads, including already persisted V2 when off."""
+    if _equipment_enabled():
+        reader = _snapshot_read_repo()
+    else:
+        service = _equipment_service()
+        reader = getattr(service, "stats_repo", repo) if service is not None else repo
+    if summary is None:
+        loader = getattr(reader, "load_summary", None)
+        if not callable(loader):
+            return False
+        summary = await loader(timestamp)
+    if not isinstance(summary, dict):
+        return False
+    if summary.get("schema_version") == 2 or summary.get("equipment_source") == "local_win_v2":
+        return True
+    if not _equipment_enabled() or summary.get("ranking_display_kind") != "current":
+        return False
+    scope = summary.get("kungfu_cache_scope")
+    latest_reader = getattr(reader, "get_latest_current_summary", None)
+    if not isinstance(scope, dict) or not scope.get("season_id") or not callable(latest_reader):
+        return False
+    latest = await latest_reader(scope)
+    return bool(latest and latest.get("timestamp") == timestamp)
+
+
+async def _equipment_frozen(timestamp: int, expected_view_revision=None):
+    service = _equipment_service()
+    if service is None:
+        return None, _equipment_failure("read_failed")
+    try:
+        payload = await service.read_frozen_snapshot(timestamp, expected_view_revision=expected_view_revision)
+        return payload, None
+    except Exception as exc:
+        logger.warning("JJC frozen equipment read failed: exception_type={}", type(exc).__name__)
+        return None, _equipment_failure(getattr(exc, "code", "read_failed"))
 
 
 def _build_peak_kungfu_statistics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -88,32 +203,36 @@ async def _load_peak_score_doc(
         return None
 
 
-@router.get("/ranking-stats")
-async def get_ranking_stats(
-    action: str = Query("list", description="list、seasons、season-history 或 read"),
-    timestamp: Optional[str] = Query(None, description="read 模式下的时间戳"),
-    season: Optional[str] = Query(None, description="season-history 模式下的赛季名称"),
-    page: Optional[int] = Query(None, ge=1, description="list 模式分页页码"),
-    page_size: Optional[int] = Query(None, ge=1, le=100, description="list 模式分页大小"),
-    with_meta: bool = Query(False, description="list 模式返回元数据列表"),
-) -> dict[str, Any]:
-    action = action.strip().lower()
+async def _read_snapshot_metadata(action, season, page, page_size, with_meta):
+    if not _equipment_enabled():
+        return await _read_snapshot_metadata_selected(action, season, page, page_size, with_meta)
+    try:
+        return await _read_snapshot_metadata_selected(action, season, page, page_size, with_meta)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("JJC optional snapshot metadata read failed: exception_type={}", type(exc).__name__)
+        raise EquipmentSnapshotError("read_failed") from None
+
+
+async def _read_snapshot_metadata_selected(action, season, page, page_size, with_meta):
+    """Preserve legacy metadata formats; strict V2 read failures reach HTTP 503."""
     if action == "seasons":
-        return success_response(await JjcRankingStatsRepo().list_seasons())
+        return success_response(await _snapshot_read_repo().list_seasons())
 
     if action == "season-history":
         normalized_season = str(season or "").strip()
         if not normalized_season:
             return error_response("invalid_season")
         return success_response(
-            await JjcRankingStatsRepo().list_season_history(normalized_season)
+            await _snapshot_read_repo().list_season_history(normalized_season)
         )
 
     if action == "list":
         if with_meta:
             normalized_page = page or 1
             normalized_page_size = page_size or 100
-            mongo_result = await JjcRankingStatsRepo().list_timestamps(
+            mongo_result = await _snapshot_read_repo().list_timestamps(
                 page=normalized_page,
                 page_size=normalized_page_size,
                 with_meta=True,
@@ -141,7 +260,7 @@ async def get_ranking_stats(
         if page is not None or page_size is not None:
             normalized_page = page or 1
             normalized_page_size = page_size or 20
-            mongo_result = await JjcRankingStatsRepo().list_timestamps(
+            mongo_result = await _snapshot_read_repo().list_timestamps(
                 page=normalized_page,
                 page_size=normalized_page_size,
             )
@@ -168,7 +287,7 @@ async def get_ranking_stats(
                 "has_more": False,
             })
 
-        mongo_timestamps = await JjcRankingStatsRepo().list_timestamps()
+        mongo_timestamps = await _snapshot_read_repo().list_timestamps()
         if not mongo_timestamps:
             logger.info("JJC ranking stats list 未命中数据")
             return error_response("not_found")
@@ -179,11 +298,49 @@ async def get_ranking_stats(
         )
         return success_response(mongo_timestamps)
 
+
+@router.get("/ranking-stats")
+async def get_ranking_stats(
+    action: str = Query("list", description="list、seasons、season-history 或 read"),
+    timestamp: Optional[str] = Query(None, description="read 模式下的时间戳"),
+    season: Optional[str] = Query(None, description="season-history 模式下的赛季名称"),
+    page: Optional[int] = Query(None, ge=1, description="list 模式分页页码"),
+    page_size: Optional[int] = Query(None, ge=1, le=100, description="list 模式分页大小"),
+    with_meta: bool = Query(False, description="list 模式返回元数据列表"),
+    equipment_contract: Optional[str] = Query(None),
+) -> Any:
+    action = action.strip().lower()
+    if action in ("seasons", "season-history", "list"):
+        try:
+            return await _read_snapshot_metadata(action, season, page, page_size, with_meta)
+        except Exception as exc:
+            if getattr(exc, "code", None) == "read_failed":
+                logger.warning("JJC snapshot metadata read failed: exception_type={}", type(exc).__name__)
+                return _equipment_failure("read_failed")
+            raise
+
     if action == "read":
         if not timestamp or not timestamp.isdigit():
             return error_response("invalid_timestamp")
 
-        mongo_payload = await JjcRankingStatsRepo().load_summary(int(timestamp))
+        if _equipment_contract(equipment_contract):
+            stamp = _equipment_timestamp(timestamp)
+            if stamp is None:
+                return _equipment_failure("invalid_timestamp")
+            payload, failure = await _equipment_frozen(stamp)
+            if failure is not None:
+                return failure
+            return success_response(payload) if payload is not None else _equipment_failure("not_found")
+        try:
+            repo = _snapshot_read_repo()
+            mongo_payload = await repo.load_summary(int(timestamp))
+            if mongo_payload is not None and await _equipment_mode(repo, int(timestamp), mongo_payload):
+                return _equipment_failure("equipment_contract_upgrade_required")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("JJC equipment protocol check failed: exception_type={}", type(exc).__name__)
+            return _equipment_failure("read_failed")
         if mongo_payload is not None:
             logger.info("JJC ranking stats read 命中 Mongo: timestamp={}".format(timestamp))
             return success_response(mongo_payload)
@@ -200,12 +357,16 @@ async def get_ranking_stats_details(
     range_key: str = Query(..., alias="range", description="排名范围，如 top_200"),
     lane: str = Query(..., description="healer 或 dps"),
     kungfu: str = Query(..., description="心法名称"),
-) -> dict[str, Any]:
+    equipment_contract: Optional[str] = Query(None),
+    expected_view_revision: Optional[str] = Query(None),
+) -> Any:
+    if _equipment_contract(equipment_contract) and _equipment_timestamp(timestamp) is None:
+        return _equipment_failure("invalid_timestamp")
     if not timestamp.isdigit():
         return error_response("invalid_timestamp")
 
     lane = lane.strip().lower()
-    if lane not in {"healer", "dps"}:
+    if lane not in {"healer", "dps"} and not (_equipment_contract(equipment_contract) and lane == "unknown"):
         return error_response("invalid_lane")
 
     kungfu = kungfu.strip()
@@ -213,12 +374,33 @@ async def get_ranking_stats_details(
     if not kungfu or not range_key:
         return error_response("invalid_params")
 
-    mongo_payload = await JjcRankingStatsRepo().load_detail(
-        int(timestamp),
-        range_key,
-        lane,
-        kungfu,
-    )
+    repo = JjcRankingStatsRepo()
+    try:
+        equipment_mode = await _equipment_mode(repo, int(timestamp))
+    except Exception as exc:
+        logger.warning("JJC equipment detail protocol check failed: exception_type={}", type(exc).__name__)
+        return _equipment_failure("read_failed")
+    if equipment_mode:
+        if not _equipment_contract(equipment_contract):
+            return _equipment_failure("equipment_contract_upgrade_required")
+        if range_key not in _RANGE_LIMITS:
+            return _equipment_failure("invalid_range")
+        if not isinstance(expected_view_revision, str) or not expected_view_revision:
+            return _equipment_failure("version_mismatch")
+        payload, failure = await _equipment_frozen(int(timestamp), expected_view_revision)
+        if failure is not None:
+            return failure
+        view = (payload or {}).get("equipment_view")
+        if not isinstance(view, dict):
+            return _equipment_failure("version_mismatch")
+        members = [m for m in view["members"] if m["rank"] <= _RANGE_LIMITS[range_key]
+                   and m.get("lane") == lane
+                   and ((m.get("kungfu") or "未知") == kungfu
+                        or (lane == "unknown" and kungfu == "unknown"))]
+        return success_response({"timestamp": int(timestamp), "range": range_key, "lane": lane,
+            "kungfu": kungfu, "equipment_view_revision": view["equipment_view_revision"],
+            "members": members})
+    mongo_payload = await repo.load_detail(int(timestamp), range_key, lane, kungfu)
     if mongo_payload is not None:
         logger.info(
             "JJC ranking stats detail 命中 Mongo: timestamp={} range={} lane={} kungfu={}".format(
@@ -228,7 +410,8 @@ async def get_ranking_stats_details(
                 kungfu,
             )
         )
-        return success_response(mongo_payload)
+        return success_response({**mongo_payload, "members": [public_display_member(member)
+            for member in mongo_payload.get("members", [])]})
 
     logger.info(
         "JJC ranking stats detail Mongo 未命中: timestamp={} range={} lane={} kungfu={}".format(
@@ -245,8 +428,12 @@ async def get_ranking_stats_details(
 async def get_ranking_stats_flat_members(
     timestamp: str = Query(..., description="统计时间戳"),
     range_key: str = Query("top_1000", alias="range", description="排名范围"),
-) -> Dict[str, Any]:
+    equipment_contract: Optional[str] = Query(None),
+    expected_view_revision: Optional[str] = Query(None),
+) -> Any:
     started_at = time.perf_counter()
+    if _equipment_contract(equipment_contract) and _equipment_timestamp(timestamp) is None:
+        return _equipment_failure("invalid_timestamp")
     if not timestamp.isdigit():
         return error_response("invalid_timestamp")
     range_key = range_key.strip()
@@ -261,11 +448,28 @@ async def get_ranking_stats_flat_members(
             limit,
         )
     )
-    result = await JjcRankingStatsRepo().list_flat_members(
-        int(timestamp),
-        range_key,
-        limit=limit,
-    )
+    repo = JjcRankingStatsRepo()
+    try:
+        equipment_mode = await _equipment_mode(repo, int(timestamp))
+    except Exception as exc:
+        logger.warning("JJC equipment flat protocol check failed: exception_type={}", type(exc).__name__)
+        return _equipment_failure("read_failed")
+    if equipment_mode:
+        if not _equipment_contract(equipment_contract):
+            return _equipment_failure("equipment_contract_upgrade_required")
+        if not isinstance(expected_view_revision, str) or not expected_view_revision:
+            return _equipment_failure("version_mismatch")
+        payload, failure = await _equipment_frozen(int(timestamp), expected_view_revision)
+        if failure is not None:
+            return failure
+        view = (payload or {}).get("equipment_view")
+        if not isinstance(view, dict):
+            return _equipment_failure("version_mismatch")
+        members = [m for m in view["members"] if m["rank"] <= limit]
+        return success_response({"timestamp": int(timestamp), "range": range_key,
+            "equipment_view_revision": view["equipment_view_revision"], "items": members,
+            "total": len(members), "item_count": len(members)})
+    result = await repo.list_flat_members(int(timestamp), range_key, limit=limit)
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     logger.info(
         "JJC flat-members request done: timestamp={} range={} limit={} elapsed_ms={} item_count={} total={} detail_count={}".format(
@@ -280,7 +484,7 @@ async def get_ranking_stats_flat_members(
     )
     if not result.get("items"):
         return error_response("not_found", data=result)
-    return success_response(result)
+    return success_response({**result, "items": [public_display_member(member) for member in result["items"]]})
 
 
 @router.get("/ranking-stats/peak-score")
@@ -449,6 +653,7 @@ async def get_ranking_stats_role_recent(
     name: str = Query(..., description="角色名"),
     game_role_id: Optional[str] = Query(None, description="榜单角色 ID"),
     global_role_id: Optional[str] = Query(None, description="推栏全局角色 ID"),
+    global_id: Optional[str] = Query(None, description="推栏 replay 数字全局角色 ID"),
     role_id: Optional[str] = Query(None, description="推栏角色 ID"),
     zone: Optional[str] = Query(None, description="区服分区"),
     cursor: int = Query(0, ge=0, le=2000, description="分页游标，0 表示第一页"),
@@ -466,6 +671,7 @@ async def get_ranking_stats_role_recent(
         identity_hints={
             "game_role_id": (game_role_id or "").strip() or None,
             "global_role_id": (global_role_id or "").strip() or None,
+            "global_id": (global_id or "").strip() or None,
             "role_id": (role_id or "").strip() or None,
             "zone": (zone or "").strip() or None,
         },
@@ -491,7 +697,7 @@ async def get_ranking_stats_role_indicator(
     server = server.strip()
     name = name.strip()
     if not server or not name:
-        return error_response("invalid_params")
+        return error_response("invalid_params", data={"error": True, "message": "invalid_params"})
 
     result = await jjc_ranking_inspect_service.get_role_indicator(
         server=server,
@@ -637,3 +843,73 @@ async def get_ranking_stats_match_detail(
     if result.get("error"):
         return error_response(result.get("message") or result.get("error") or "unknown_error", data=result)
     return success_response(result)
+
+
+@router.get("/ranking-stats/current-displays")
+async def get_ranking_stats_current_displays(
+    timestamp: Optional[str] = Query(None),
+    range_key: Optional[str] = Query(None, alias="range"),
+    ranks: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    if (not timestamp or len(timestamp) > 20 or not timestamp.isascii() or not timestamp.isdigit() or int(timestamp) <= 0
+            or range_key not in _RANGE_LIMITS or not ranks or len(ranks) > 4096):
+        return error_response("invalid_params")
+    parts = ranks.split(",")
+    if any(not part.isascii() or not part.isdigit() or len(part) > 10 or int(part) <= 0 for part in parts):
+        return error_response("invalid_ranks")
+    requested = list(dict.fromkeys(int(part) for part in parts))
+    if len(requested) > 100 or any(rank > _RANGE_LIMITS[range_key] for rank in requested):
+        return error_response("invalid_ranks")
+    # Lazy assembly keeps route import independent of optional singleton setup.
+    from src.services.jx3.singletons import jjc_ranking_display_service
+    try:
+        service = _equipment_service()
+        if service is not None:
+            if not _equipment_overlay_enabled():
+                return success_response({"timestamp": int(timestamp), "range": range_key,
+                    "overlay_enabled": False, "items": [], "reason": "disabled"})
+            if await _equipment_mode(JjcRankingStatsRepo(), int(timestamp)):
+                return success_response({"timestamp": int(timestamp), "range": range_key,
+                    "overlay_enabled": False, "items": [], "reason": "equipment_contract_upgrade_required"})
+        return success_response(await jjc_ranking_display_service.read(int(timestamp), range_key, requested))
+    except DisplayRequestError as exc:
+        return error_response(str(exc))
+    except Exception as exc:
+        logger.warning("JJC ranking display read failed: exception_type={}", type(exc).__name__)
+        return error_response("read_failed")
+
+
+@router.get("/ranking-stats/equipment-view")
+async def get_ranking_stats_equipment_view(
+    request: Request,
+    timestamp: Optional[str] = Query(None),
+    equipment_contract: Optional[str] = Query(None),
+    expected_member_revision: Optional[str] = Query(None),
+    expected_frozen_source: Optional[str] = Query(None),
+) -> Any:
+    allowed = {"timestamp", "equipment_contract", "expected_member_revision", "expected_frozen_source"}
+    pairs = list(request.query_params.multi_items())
+    stamp = _equipment_timestamp(timestamp)
+    if (set(request.query_params) - allowed or len(pairs) != len(set(request.query_params))
+            or stamp is None or not _equipment_contract(equipment_contract)
+            or not isinstance(expected_member_revision, str) or not 0 < len(expected_member_revision) <= 128
+            or not expected_member_revision.isascii()
+            or any(not (ch.isalnum() or ch in "._:-") for ch in expected_member_revision)
+            or expected_frozen_source not in ("legacy_v1", "local_win_v2")):
+        return _equipment_failure("invalid_params")
+    # This gate precedes even optional service assembly and all repositories.
+    if not _equipment_overlay_enabled() or not _equipment_enabled():
+        return success_response({"timestamp": stamp, "overlay_enabled": False,
+            "retired": False, "reload_required": False, "reason": "disabled", "view": None})
+    service = _equipment_service()
+    if service is None:
+        return _equipment_failure("read_failed")
+    try:
+        result = await service.read_dynamic_view(timestamp=stamp,
+            expected_member_revision=expected_member_revision, expected_frozen_source=expected_frozen_source)
+        return success_response(result)
+    except Exception as exc:
+        logger.warning("JJC whole-board equipment read failed: exception_type={}", type(exc).__name__)
+        instructions = _public_revocations(getattr(exc, "revocations", []))
+        return _equipment_failure(getattr(exc, "code", "read_failed"),
+                                  data={"revocations": instructions} if instructions else None)

@@ -12,6 +12,10 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 
+from src.utils.jjc_query_observability import foreground_safe_logger
+
+logger = foreground_safe_logger(logger, component="inspect")
+
 @dataclass(frozen=True)
 class MatchHistoryClient:
     """

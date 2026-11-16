@@ -26,7 +26,9 @@ def _prepare_template_data(
             v,
             f"{v / valid_count * 100:.1f}%" if valid_count > 0 else "0%",
             min_score,
-            _calculate_legendary_percent(members_map.get(k, [])),
+            ((rank_data[rank_type].get("equipment_metrics", {}).get(k, {}).get("legendary_ratio") or 0) * 100
+             if rank_data.get("equipment_source") == "local_win_v2"
+             else _calculate_legendary_percent(members_map.get(k, []))),
         )
         for k, v in sorted_list
     ]
@@ -48,13 +50,19 @@ def _calculate_legendary_percent(members: list[dict[str, Any]]) -> float:
 
 def _coverage_label(rank_data: dict[str, Any]) -> str:
     cache = rank_data.get("kungfu_cache")
-    if not cache:
-        return "心法覆盖率未记录"
-    return (f"心法覆盖 {(cache.get('coverage') or 0) * 100:.1f}% · "
-            f"未知 {cache.get('unknown', 0)}")
+    label = (f"心法覆盖 {(cache.get('coverage') or 0) * 100:.1f}% · "
+             f"未知 {cache.get('unknown', 0)}") if cache else "心法覆盖率未记录"
+    if rank_data.get("equipment_source") == "local_win_v2":
+        metrics = rank_data.get("equipment_metrics") or {}
+        coverage = metrics.get("equipment_coverage")
+        label += f" · 装备覆盖 {coverage*100:.1f}%" if coverage is not None else " · 装备覆盖 --"
+        label += f" · 装备未知 {metrics.get('U', 0)}"
+    return label
 
 
 def _equipment_incomplete(rank_data: dict[str, Any]) -> bool:
+    if rank_data.get("equipment_source") == "local_win_v2" and isinstance(rank_data.get("equipment_metrics"), dict):
+        return False
     return any((rank_data.get(lane) or {}).get("equipment_incomplete", False)
                for lane in ("healer", "dps"))
 

@@ -1,0 +1,401 @@
+{
+  "冰心诀": {
+    "name": "冰心诀",
+    "id": 10081,
+    "force": 5,
+    "kungfuId": 10,
+    "school": 4,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "云裳心经": {
+    "name": "云裳心经",
+    "id": 10080,
+    "force": 5,
+    "kungfuId": 9,
+    "school": 4,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "花间游": {
+    "name": "花间游",
+    "id": 10021,
+    "force": 2,
+    "kungfuId": 5,
+    "school": 2,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "离经易道": {
+    "name": "离经易道",
+    "id": 10028,
+    "force": 2,
+    "kungfuId": 7,
+    "school": 2,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "毒经": {
+    "name": "毒经",
+    "id": 10175,
+    "force": 6,
+    "kungfuId": 13,
+    "school": 9,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "补天诀": {
+    "name": "补天诀",
+    "id": 10176,
+    "force": 6,
+    "kungfuId": 14,
+    "school": 9,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "莫问": {
+    "name": "莫问",
+    "id": 10447,
+    "force": 22,
+    "kungfuId": 22,
+    "school": 19,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "相知": {
+    "name": "相知",
+    "id": 10448,
+    "force": 22,
+    "kungfuId": 23,
+    "school": 19,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "无方": {
+    "name": "无方",
+    "id": 10627,
+    "force": 212,
+    "kungfuId": 29,
+    "school": 24,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "灵素": {
+    "name": "灵素",
+    "id": 10626,
+    "force": 212,
+    "kungfuId": 28,
+    "school": 24,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "傲血战意": {
+    "name": "傲血战意",
+    "id": 10026,
+    "force": 3,
+    "kungfuId": 6,
+    "school": 1,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "铁牢律": {
+    "name": "铁牢律",
+    "id": 10062,
+    "force": 3,
+    "kungfuId": 8,
+    "school": 1,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "易筋经": {
+    "name": "易筋经",
+    "id": 10003,
+    "force": 1,
+    "kungfuId": 2,
+    "school": 5,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "洗髓经": {
+    "name": "洗髓经",
+    "id": 10002,
+    "force": 1,
+    "kungfuId": 1,
+    "school": 5,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "焚影圣诀": {
+    "name": "焚影圣诀",
+    "id": 10242,
+    "force": 10,
+    "kungfuId": 17,
+    "school": 8,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "明尊琉璃体": {
+    "name": "明尊琉璃体",
+    "id": 10243,
+    "force": 10,
+    "kungfuId": 18,
+    "school": 8,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "分山劲": {
+    "name": "分山劲",
+    "id": 10390,
+    "force": 21,
+    "kungfuId": 21,
+    "school": 18,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "铁骨衣": {
+    "name": "铁骨衣",
+    "id": 10389,
+    "force": 21,
+    "kungfuId": 20,
+    "school": 18,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "紫霞功": {
+    "name": "紫霞功",
+    "id": 10014,
+    "force": 4,
+    "kungfuId": 3,
+    "school": 3,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "太虚剑意": {
+    "name": "太虚剑意",
+    "id": 10015,
+    "force": 4,
+    "kungfuId": 4,
+    "school": 3,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "天罗诡道": {
+    "name": "天罗诡道",
+    "id": 10225,
+    "force": 7,
+    "kungfuId": 16,
+    "school": 10,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "惊羽诀": {
+    "name": "惊羽诀",
+    "id": 10224,
+    "force": 7,
+    "kungfuId": 15,
+    "school": 10,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "问水诀": {
+    "name": "问水诀",
+    "id": 10144,
+    "force": 8,
+    "kungfuId": 11,
+    "school": 6,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "山居剑意": {
+    "name": "山居剑意",
+    "id": 10145,
+    "force": 8,
+    "kungfuId": 11,
+    "school": 6,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "笑尘诀": {
+    "name": "笑尘诀",
+    "id": 10268,
+    "force": 9,
+    "kungfuId": 19,
+    "school": 7,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "北傲诀": {
+    "name": "北傲诀",
+    "id": 10464,
+    "force": 23,
+    "kungfuId": 24,
+    "school": 20,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  },
+  "凌海诀": {
+    "name": "凌海诀",
+    "id": 10533,
+    "force": 24,
+    "kungfuId": 25,
+    "school": 21,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "隐龙诀": {
+    "name": "隐龙诀",
+    "id": 10585,
+    "force": 25,
+    "kungfuId": 26,
+    "school": 22,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "太玄经": {
+    "name": "太玄经",
+    "id": 10615,
+    "force": 211,
+    "kungfuId": 27,
+    "school": 23,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "孤锋诀": {
+    "name": "孤锋诀",
+    "id": 10698,
+    "force": 213,
+    "kungfuId": 30,
+    "school": 26,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "山海心诀": {
+    "name": "山海心诀",
+    "id": 10756,
+    "force": 214,
+    "kungfuId": 32,
+    "school": 29,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "周天功": {
+    "name": "周天功",
+    "id": 10786,
+    "force": 215,
+    "kungfuId": 33,
+    "school": 38,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "幽罗引": {
+    "name": "幽罗引",
+    "id": 10821,
+    "force": 221,
+    "kungfuId": 34,
+    "school": 39,
+    "client": [
+      "all",
+      "std"
+    ]
+  },
+  "通用": {
+    "name": "通用",
+    "id": 0,
+    "force": 0,
+    "kungfuId": 0,
+    "school": 0,
+    "client": [
+      "all",
+      "std",
+      "origin"
+    ]
+  }
+}

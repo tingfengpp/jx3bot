@@ -197,3 +197,12 @@ JJC 大橙武以 `weapon_quality == 5`（接受字符串或整数）且武器名
 主/兼容队列增加四个调度字段与 idx_status_ranking_front；最新排名批次、原始名次优先于普通 priority/FIFO，列表/位置/领取一致。同步仍从最新页查最近14天并按当前赛季截断、复用已有详情。实现记录：openspec/changes/archive/2026-11-07-jjc-ranking-force-sync-front；2026-11-07 已按用户授权提交并发布；生产候选382项通过，QQ/API/双队列索引及4个内部worker验收通过；单角色冷却重新插队由真实worker完成。详见该change的deployment.md。需统一更新 bot/独立 worker，停旧消费者后升级；不能混用新生产者与旧 worker。回滚先物化 pending 为普通 queued，详见 runbook。
 
 验证：`.venv/bin/python -m unittest tests.test_jjc_ranking_force_sync tests.test_jjc_sync_worker_queue tests.test_jjc_match_data_sync tests.test_jjc_ranking_stats_repo tests.test_jjc_ranking_command_tag`。真实 Mongo：`JJC_TEST_MONGO_URI=mongodb://127.0.0.1:27029/ .venv/bin/python -m unittest tests.test_jjc_ranking_force_sync_mongo`，仅允许该显式本地隔离端口与随机测试库。
+
+
+### 排行榜本地最新胜场装备
+
+`JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED=1` 后，按稳定角色 ID 读取本地当前赛季最新一场 3v3 胜场，统一提供装备、队友、橙武统计和紫武筛选。取最新胜场后装备缺失时保留未知，不向更旧胜场回退；心法分类保留原有来源。默认值为 0，支持环境变量与私有 runtime_config.json，修改后重启。`JJC_RANKING_DISPLAY_QUERY_ENABLED` 与 `JJC_RANKING_DISPLAY_OVERLAY_ENABLED` 是既有资料查询和展示覆盖开关，各自默认 0。
+
+读服务使用专用 Mongo 连接和 singleflight，在原 1.5 秒 Mongo、2 秒 socket、8 秒构建、10 秒请求预算内完成整榜；超时或证据不一致时明确失败，不截断成员或丢弃异常证据。`JJC_EQUIPMENT_MONGO_HOST` 默认为空，仅在有明确部署需要时覆盖装备读连接的主机，凭据仍取部署配置。
+
+开启前必须完成主表派生字段回填、索引校验与全榜只读预检。字段、索引及回滚限制见 `docs/design-docs/database-design.md` 和 `docs/references/runbook.md`。方案与验证记录见 `openspec/changes/jjc-ranking-local-latest-match/`；独立提交包验证见其中 `submission.md`。

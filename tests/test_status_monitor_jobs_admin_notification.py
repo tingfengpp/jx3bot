@@ -44,6 +44,8 @@ def _load_jobs(
         "src",
         "src.plugins",
         "src.plugins.status_monitor",
+        "src.infra",
+        "src.infra.jx3api_compat",
         "config",
         "nonebot",
         "nonebot.adapters",
@@ -66,7 +68,7 @@ def _load_jobs(
     sys.modules["config"] = config_mod
 
     src_mod = types.ModuleType("src")
-    src_mod.__path__ = []
+    src_mod.__path__ = [str(Path(__file__).resolve().parents[1] / "src")]
     plugins_mod = types.ModuleType("src.plugins")
     plugins_mod.__path__ = []
     status_monitor_mod = types.ModuleType("src.plugins.status_monitor")
@@ -229,7 +231,11 @@ class StatusMonitorJobsAdminNotificationTests(unittest.TestCase):
 
     def test_push_daily_jjc_ranking_notifies_unexpected_exception(self) -> None:
         module = _load_jobs()
-        _, notify = self._prepare_ranking_job(module)
+        _, notify = self._prepare_ranking_job(
+            module,
+            ranking_result={"code": 0, "defaultWeek": 1},
+            ranking_data={"kungfu_statistics": {"dps": {}}},
+        )
         module.group_config_repo.load = AsyncMock(side_effect=RuntimeError("Mongo不可用"))
 
         asyncio.run(module.push_daily_jjc_ranking())
@@ -238,27 +244,22 @@ class StatusMonitorJobsAdminNotificationTests(unittest.TestCase):
         self.assertIn("Mongo不可用", notify.await_args.args[1])
 
     def test_push_daily_jjc_ranking_does_not_notify_when_no_bot_or_target_group(self) -> None:
-        module = _load_jobs()
-        module.BOT_INITIALIZED = True
-        module.get_driver = lambda: types.SimpleNamespace(bots={})
-        no_bot_notify = AsyncMock()
-        module.notify_jjc_ranking_failure = no_bot_notify
+        for online in (False, True):
+            with self.subTest(online=online):
+                module = _load_jobs()
+                bot, notify = self._prepare_ranking_job(
+                    module,
+                    ranking_result={"code": 0, "defaultWeek": 1},
+                    ranking_data={"kungfu_statistics": {"dps": {}}},
+                )
+                module.get_driver = lambda: types.SimpleNamespace(
+                    bots={"test": bot} if online else {}
+                )
+                module.group_config_repo.load.return_value = {"123": {"竞技排名推送": False}}
 
-        asyncio.run(module.push_daily_jjc_ranking())
+                asyncio.run(module.push_daily_jjc_ranking())
 
-        no_bot_notify.assert_not_awaited()
-
-        module = _load_jobs()
-        bot = _FakeBot()
-        module.BOT_INITIALIZED = True
-        module.get_driver = lambda: types.SimpleNamespace(bots={"test": bot})
-        module.group_config_repo.load = AsyncMock(return_value={"123": {"竞技排名推送": False}})
-        no_group_notify = AsyncMock()
-        module.notify_jjc_ranking_failure = no_group_notify
-
-        asyncio.run(module.push_daily_jjc_ranking())
-
-        no_group_notify.assert_not_awaited()
+                notify.assert_not_awaited()
 
 
 if __name__ == "__main__":

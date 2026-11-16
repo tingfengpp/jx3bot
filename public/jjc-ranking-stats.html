@@ -146,6 +146,9 @@
         }
 
         .status {
+            min-width: 0;
+            max-width: 100%;
+            overflow-wrap: anywhere;
             margin-top: 18px;
             padding: 12px 16px;
             border-radius: 16px;
@@ -177,12 +180,15 @@
         }
 
         .history-field.snapshot-field {
-            min-width: min(360px, 100%);
+            min-width: 0;
+            max-width: 100%;
             flex: 1 1 280px;
         }
 
         .history-field select,
         .legacy-date-select {
+            min-width: 0;
+            max-width: 100%;
             min-height: 34px;
             border-radius: 10px;
             border: 1px solid rgba(137, 196, 244, 0.35);
@@ -552,7 +558,12 @@
             display: flex;
             align-items: center;
             gap: 6px;
+            min-width: 0;
         }
+
+        .detail-name > div { min-width: 0; overflow-wrap: anywhere; }
+        .ranking-display { display: block; min-width: 0; }
+        .ranking-display-note { display: block; font-size: 0.72rem; line-height: 1.45; margin-top: 4px; overflow-wrap: anywhere; }
 
         .detail-weapon {
             width: 18px;
@@ -1666,6 +1677,7 @@
         <span class="floating-feedback-text">反馈</span>
     </div>
 
+    <script src="jjc-equipment-view.js?contract=2"></script>
     <script>
         const BASE_API = "/jx3bot/api/jjc/ranking-stats";
         const SEASONS_API = `${BASE_API}?action=seasons`;
@@ -1694,19 +1706,19 @@
             "太虚剑意": "10015",
             "花间游": "10021",
             "离经易道": "10028",
-            "傲血战意": "10062",
-            "铁牢律": "10061",
+            "傲血战意": "10026",
+            "铁牢律": "10062",
             "冰心诀": "10081",
             "云裳心经": "10080",
             "毒经": "10175",
             "补天诀": "10176",
-            "山居剑意": "10144",
-            "问水诀": "10145",
-            "天罗诡道": "10224",
-            "惊羽诀": "10225",
-            "分山劲": "10268",
-            "铁骨衣": "10267",
-            "笑尘诀": "10390",
+            "山居剑意": "10145",
+            "问水诀": "10144",
+            "天罗诡道": "10225",
+            "惊羽诀": "10224",
+            "分山劲": "10390",
+            "铁骨衣": "10389",
+            "笑尘诀": "10268",
             "焚影圣诀": "10242",
             "明尊琉璃体": "10243",
             "莫问": "10447",
@@ -1714,13 +1726,13 @@
             "北傲诀": "10464",
             "凌海诀": "10533",
             "隐龙诀": "10585",
-            "无方": "10615",
-            "灵素": "10616",
+            "无方": "10627",
+            "灵素": "10626",
             "孤锋诀": "10698",
             "山海心诀": "10756",
             "周天功": "10786",
-            "太玄经": "10821",
-            "幽罗引": "10886",
+            "太玄经": "10615",
+            "幽罗引": "10821",
         };
 
         const subtitle = document.getElementById("subtitle");
@@ -1748,6 +1760,241 @@
         const roleIndicatorCache = new Map();
         const matchDetailCache = new Map();
         const rankingListCache = new Map();
+        // Raw caches stay immutable. Each anchor owns a separate dynamic layer.
+        const rankingDisplaySnapshots = new Map();
+        const rankingDisplayMembers = new Map();
+        let rankingDisplayExportDepth = 0;
+        let rankingDisplayFrozenExport = null;
+        const rankingDisplayPoller = createRankingDisplayPoller({
+            getContext: getRankingDisplayContext,
+            fetchBatch: async ({timestamp, range, ranks, signal}) => {
+                const url = new URL(`${BASE_API}/current-displays`, window.location.origin);
+                url.searchParams.set("timestamp", timestamp);
+                url.searchParams.set("range", range);
+                url.searchParams.set("ranks", ranks.join(","));
+                const response = await fetch(url, {cache: "no-store", signal});
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return unwrapResponse(await response.json());
+            },
+            applyBatch: applyRankingDisplayBatch,
+            onError: markRankingDisplayReadFailure,
+            schedule: (fn, ms) => window.setTimeout(fn, ms),
+            cancelSchedule: id => window.clearTimeout(id),
+        });
+        const equipmentAPI = window.JjcEquipmentView?.CONTRACT === 2 ? window.JjcEquipmentView : null;
+        let equipmentViewState = null, equipmentFrozenPayload = null, equipmentCommitting = false;
+        let equipmentStopped = false;
+        // Identity metadata only: never a display/export fallback.
+        let equipmentRevocationBasis = null;
+        let equipmentBootstrapReload = null, equipmentBootstrapEpoch = 0;
+        const equipmentPoller = equipmentAPI?.createPoller({
+            getContext: () => ({timestamp: currentStatsTimestamp, manifest: equipmentViewState?.manifest,
+                visible: document.visibilityState === "visible" && currentStats?.ranking_display_kind === "current",
+                tab: currentOuterTab, exporting: rankingDisplayExportDepth > 0}),
+            fetchView: async ({timestamp, expected_member_revision, expected_frozen_source, signal}) => {
+                const url = new URL(`${BASE_API}/equipment-view`, window.location.origin);
+                for (const [key, value] of Object.entries({timestamp, equipment_contract: 2, expected_member_revision, expected_frozen_source})) url.searchParams.set(key, value);
+                const response = await fetch(url, {cache: "no-store", signal});
+                const payload = await response.json();
+                if (!response.ok || payload.status_code !== 0) {
+                    const error = new Error(payload.status_msg || `HTTP ${response.status}`);
+                    error.revocations = payload.data?.revocations || []; throw error;
+                }
+                return payload.data;
+            },
+            applyResponse: applyEquipmentResponse,
+            onError: error => applyEquipmentResponse({read_failed: true, revocations: error.revocations || []}),
+            schedule: (fn, ms) => window.setTimeout(fn, ms), cancelSchedule: id => window.clearTimeout(id),
+        });
+        function suspendRankingDisplays() {
+            rankingDisplayPoller.suspend();
+            if (!equipmentCommitting) {
+                equipmentPoller?.suspend();
+                pauseEquipmentBootstrapReload();
+            }
+        }
+        function activateRankingDisplays() {
+            if (equipmentBootstrapReload) {
+                rankingDisplayPoller.suspend();
+                equipmentPoller?.suspend();
+                resumeEquipmentBootstrapReload();
+                return;
+            }
+            if (equipmentViewState?.manifest) {
+                rankingDisplayPoller.suspend();
+                if (!equipmentCommitting && !equipmentStopped) equipmentPoller?.activate();
+            } else rankingDisplayPoller.activate();
+        }
+        function tickRankingDisplays() {
+            if (equipmentViewState?.manifest) equipmentPoller?.tick(); else rankingDisplayPoller.tick();
+        }
+        function equipmentDetailKey(node) {
+            return [node.dataset.range, node.dataset.lane, node.dataset.kungfu].join("|");
+        }
+        function pauseEquipmentBootstrapReload(clear = false) {
+            const job = equipmentBootstrapReload;
+            if (!job) return;
+            job.epoch = ++equipmentBootstrapEpoch;
+            if (job.timer !== null) window.clearTimeout(job.timer);
+            job.timer = null;
+            if (job.controller) job.controller.abort();
+            job.controller = null;
+            if (clear) equipmentBootstrapReload = null;
+        }
+        function canReloadEquipmentBootstrap(job) {
+            return equipmentBootstrapReload === job && String(currentStatsTimestamp) === job.timestamp
+                && document.visibilityState === "visible" && !isPeakTab(currentOuterTab)
+                && rankingDisplayExportDepth === 0;
+        }
+        function showEquipmentPending(message, failed = false) {
+            delete grid.dataset.equipmentRevision;
+            grid.innerHTML = `<div class="range-card muted${failed ? " error" : ""}">${escapeHtml(message)}</div>`;
+        }
+        function adoptEquipmentBootstrap(data) {
+            equipmentFrozenPayload = JSON.parse(JSON.stringify(data));
+            equipmentStopped = false;
+            equipmentViewState = null;
+            equipmentRevocationBasis = null;
+            rankingDisplayMembers.clear(); rankingDisplaySnapshots.clear();
+            detailCache.clear(); rankingListCache.clear();
+            const manifest = data.bootstrap_manifest || (data.member_revision ? {
+                member_revision: data.member_revision, frozen_source: data.frozen_source || data.equipment_source} : null);
+            if (equipmentAPI && manifest?.member_revision) {
+                const frozen = data.equipment_view || null;
+                equipmentRevocationBasis = frozen || (data.kungfu_cache_scope && Array.isArray(data.equipment_members) ? {
+                    timestamp: data.timestamp, member_revision: manifest.member_revision,
+                    scope: data.kungfu_cache_scope, members: data.equipment_members} : null);
+                equipmentViewState = {frozen, current: frozen, manifest, failed: false, reloadRequired: false, revocations: []};
+                if (frozen) {
+                    data.kungfu_statistics = equipmentAPI.equipmentStatistics(frozen, "all");
+                    grid.dataset.equipmentRevision = frozen.equipment_view_revision;
+                } else delete grid.dataset.equipmentRevision;
+            } else delete grid.dataset.equipmentRevision;
+            render(data);
+            if (equipmentViewState) activateRankingDisplays();
+            setStatus(equipmentViewState?.manifest && !equipmentViewState.current
+                ? "正在读取完整装备数据..." : "数据加载完成");
+        }
+        function resumeEquipmentBootstrapReload() {
+            const job = equipmentBootstrapReload;
+            if (!job || job.timer !== null || job.controller || !canReloadEquipmentBootstrap(job)) return;
+            attemptEquipmentBootstrapReload(job);
+        }
+        async function attemptEquipmentBootstrapReload(job) {
+            if (!canReloadEquipmentBootstrap(job) || job.controller) return;
+            const controller = new AbortController(), epoch = job.epoch;
+            job.controller = controller;
+            try {
+                const response = await fetch(buildReadUrl(job.timestamp), {cache: "no-store", signal: controller.signal});
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = unwrapResponse(await response.json());
+                if (!canReloadEquipmentBootstrap(job) || epoch !== job.epoch || controller.signal.aborted) return;
+                const manifest = data?.bootstrap_manifest;
+                if (!manifest?.member_revision || (manifest.member_revision === job.obsolete.member_revision
+                    && manifest.frozen_source === job.obsolete.frozen_source)) throw new Error("完整榜单版本尚未就绪");
+                const retained = job.ui;
+                pauseEquipmentBootstrapReload(true);
+                adoptEquipmentBootstrap(data);
+                if (equipmentViewState?.current && retained) {
+                    for (const node of grid.querySelectorAll("details")) if (retained.open.has(equipmentDetailKey(node))) {
+                        node.open = true; ensureDetailLoaded(node);
+                    }
+                    window.scrollTo(...retained.scroll);
+                }
+            } catch (error) {
+                if (!canReloadEquipmentBootstrap(job) || epoch !== job.epoch || controller.signal.aborted) return;
+                job.failures++;
+                if (equipmentViewState) equipmentViewState.failed = true;
+                showEquipmentPending("排行榜资料重载失败，稍后重试", true);
+                setStatus("排行榜资料重载失败，稍后重试", "error");
+                const delay = Math.min(60000, 30000 * 2 ** Math.min(job.failures - 1, 1));
+                job.timer = window.setTimeout(() => {
+                    job.timer = null; resumeEquipmentBootstrapReload();
+                }, delay);
+            } finally {
+                if (job.controller === controller) job.controller = null;
+            }
+        }
+        function beginEquipmentBootstrapReload(ui) {
+            equipmentPoller?.suspend(); rankingDisplayPoller.suspend();
+            if (!equipmentBootstrapReload) equipmentBootstrapReload = {
+                timestamp: String(currentStatsTimestamp), obsolete: {...equipmentViewState.manifest},
+                epoch: ++equipmentBootstrapEpoch, controller: null, timer: null, failures: 0, ui};
+            // The old roster is known obsolete. Keep its manifest only to fence
+            // bootstrap responses; never expose its cards, statistics or exports.
+            currentStats = null;
+            equipmentRevocationBasis = null;
+            showEquipmentPending("榜单资料已更新，正在重新读取完整数据...");
+            resumeEquipmentBootstrapReload();
+        }
+        function equipmentExportPending() {
+            return Boolean(equipmentBootstrapReload || equipmentViewState?.manifest && !equipmentViewState.current);
+        }
+        function applyEquipmentResponse(data) {
+            if (!equipmentViewState || rankingDisplayExportDepth) return;
+            const open = new Set([...grid.querySelectorAll("details[open]")].map(equipmentDetailKey));
+            const focus = document.activeElement?.closest?.("[data-role-name]");
+            const focusedName = focus?.dataset.roleName, focusedServer = focus?.dataset.roleServer;
+            const scroll = [window.scrollX, window.scrollY];
+            let restoredLegacy = false;
+            if (equipmentViewState.current) equipmentRevocationBasis = equipmentViewState.current;
+            equipmentViewState = equipmentAPI.applyResponse(equipmentViewState, data);
+            equipmentStopped = data.overlay_enabled === false || data.retired || data.reload_required || equipmentViewState.reloadRequired;
+            if (equipmentViewState.reloadRequired) {
+                beginEquipmentBootstrapReload({open, scroll});
+                return;
+            }
+            if (equipmentViewState.current) {
+                currentStats = {...equipmentFrozenPayload, equipment_view: equipmentViewState.current,
+                    kungfu_statistics: equipmentAPI.equipmentStatistics(equipmentViewState.current, "all")};
+            } else if (equipmentFrozenPayload && !data.read_failed && (data.reason === "disabled" || data.retired)
+                       && equipmentViewState.manifest.frozen_source === "legacy_v1"
+                       && !(equipmentRevocationBasis
+                           ? equipmentAPI.hasApplicableRevocations(equipmentRevocationBasis, equipmentViewState.revocations)
+                           : equipmentViewState.revocations.length > 0)) {
+                // Only a confirmed source-disable/retirement can restore legacy.
+                // Initial dynamic failure has no complete V2 view to fall back to.
+                currentStats = JSON.parse(JSON.stringify(equipmentFrozenPayload));
+                equipmentViewState = null; equipmentStopped = false;
+                restoredLegacy = true;
+            }
+            equipmentCommitting = true;
+            try {
+                renderCurrentView();
+                for (const node of grid.querySelectorAll("details")) if (open.has(equipmentDetailKey(node))) {
+                    node.open = true; ensureDetailLoaded(node);
+                }
+                if (focusedName) {
+                    const target = [...grid.querySelectorAll("[data-role-name]")].find(node => node.dataset.roleName === focusedName && node.dataset.roleServer === focusedServer);
+                    (target || grid.querySelector("summary"))?.focus({preventScroll: true});
+                }
+                window.scrollTo(...scroll);
+                const view = equipmentViewState?.current;
+                if (view) grid.dataset.equipmentRevision = view.equipment_view_revision;
+                else delete grid.dataset.equipmentRevision;
+            } finally {equipmentCommitting = false;}
+            // Only a confirmed V2-to-legacy transition changes poller ownership.
+            // Re-activating on every V2 commit would cancel its in-flight request.
+            if (restoredLegacy) activateRankingDisplays();
+            if (data.read_failed) setStatus("装备资料检查失败，保留此前完整数据", "error");
+        }
+        function renderLocalEquipmentDisplay(member) {
+            const packet = member.local_win_packet || {}, icons = [];
+            const known = packet.equipment_state !== "unknown";
+            const legendary = packet.equipment_state === "legendary" ? " is-legendary" : "";
+            if (known && packet.weapon_icon) icons.push(`<img class="detail-weapon${legendary}" src="${escapeHtml(packet.weapon_icon)}" alt="weapon" title="${escapeHtml(packet.weapon_name || "武器")}">`);
+            const selfId = packet.self_icon_id || packet.self_kungfu_id || resolveKungfuIconId(member);
+            if (selfId) icons.push(`<img class="detail-kungfu${legendary}" src="https://img.jx3box.com/image/xf/${escapeHtml(selfId)}.png" alt="kungfu">`);
+            for (const mate of packet.teammates || []) {
+                const id = mate.icon_id || (Object.values(kungfuIconIdByName).includes(String(mate.kungfu_id)) ? mate.kungfu_id : null);
+                const picture = id ? `<img class="detail-kungfu" src="https://img.jx3box.com/image/xf/${escapeHtml(id)}.png" alt="teammate">` : `<span class="detail-kungfu" title="未知心法">?</span>`;
+                icons.push(`<span class="detail-kungfu-wrap" data-tooltip="${escapeHtml(mate.role_name || "未知")}">${picture}</span>`);
+            }
+            let note = packet.match_time ? `最近胜场配置 · 比赛 ${formatTime(packet.match_time)} · 本地已同步` : "最近胜场配置：暂无本地胜场记录";
+            if (packet.equipment_state === "unknown") note += " · 装备未知";
+            if (["binding_invalid", "data_inconsistent"].includes(member.equipment_status)) note = "最近胜场配置：资料待核实";
+            return `<span class="detail-kungfu-row">${icons.join("")}</span><span class="ranking-display-note muted">${escapeHtml(note)}</span>`;
+        }
         const PEAK_SCOPE_CACHE_KEY = "season_bounded_v1";
         const peakScopeByTimestamp = new Map();
 
@@ -2277,6 +2524,9 @@
             if (cursor > 0) {
                 url.searchParams.set("cursor", String(cursor));
             }
+            if (identityHints.global_id) {
+                url.searchParams.set("global_id", identityHints.global_id);
+            }
             if (identityHints.game_role_id) {
                 url.searchParams.set("game_role_id", identityHints.game_role_id);
             }
@@ -2299,6 +2549,9 @@
             const url = new URL(roleIndicatorApiBase, window.location.origin);
             url.searchParams.set("server", server);
             url.searchParams.set("name", name);
+            if (identityHints.global_id) {
+                url.searchParams.set("global_id", identityHints.global_id);
+            }
             if (identityHints.game_role_id) {
                 url.searchParams.set("game_role_id", identityHints.game_role_id);
             }
@@ -2336,6 +2589,7 @@
             if (!(modal instanceof HTMLElement)) {
                 return;
             }
+            if (modal === roleModal) cancelRoleRequests();
             modal.classList.remove("show");
             modal.setAttribute("aria-hidden", "true");
             if (!roleModal.classList.contains("show") && !matchModal.classList.contains("show") && !announcementModal.classList.contains("show")) {
@@ -2343,7 +2597,230 @@
             }
         }
 
-        function renderDetailContent(members) {
+        // BEGIN RANKING DISPLAY HELPERS
+        function applyRankingDisplay(member, item) {
+            const shown = JSON.parse(JSON.stringify(member));
+            const clear = () => Object.assign(shown, {weapon_icon: null, weapon_name: null,
+                weapon_quality: null, weapon_checked: false, teammates: [], teammates_checked: false,
+                self_kungfu_id: null});
+            let packet = null;
+            if (item && ["expired", "no_win"].includes(item.state)) return clear();
+            if (item && ["available", "partial"].includes(item.state)) packet = item.packet;
+            if (!packet && member.kungfu_acquisition === "live") {
+                if (item) return shown;
+                packet = member.display_packet;
+            }
+            if (!packet) return member.kungfu_acquisition === "cache" ? clear() : shown;
+            clear();
+            shown.self_kungfu_id = packet.self_kungfu_id || null;
+            if (packet.weapon_ready === true) Object.assign(shown, {weapon_icon: packet.weapon_icon,
+                weapon_name: packet.weapon_name, weapon_quality: packet.weapon_quality, weapon_checked: true});
+            if (packet.team_ready === true) Object.assign(shown, {
+                teammates: JSON.parse(JSON.stringify(packet.teammates || [])), teammates_checked: true});
+            return shown;
+        }
+
+        function mergeRankingDisplay(previous, incoming, checkedAt) {
+            if (!incoming || !Number.isFinite(checkedAt)) return previous;
+            if (previous && checkedAt < previous.checked_at) return previous;
+            const next = JSON.parse(JSON.stringify(incoming));
+            next.checked_at = checkedAt;
+            if (!previous) return next;
+            const version = value => Number.isSafeInteger(value) && value > 0 ? value : 0;
+            const revoked = next.state === "unavailable" && next.packet === null && next.display_version == null;
+            if (revoked) return next;
+            if (version(next.display_version) < version(previous.display_version)) {
+                for (const key of ["display_version", "packet", "state", "missing_reasons", "match_id", "match_time", "requested_at", "verified_at"]) {
+                    next[key] = JSON.parse(JSON.stringify(previous[key] ?? null));
+                }
+            }
+            if (version(next.attempt_version) < version(previous.attempt_version)) {
+                next.attempt_version = previous.attempt_version;
+                next.attempt = JSON.parse(JSON.stringify(previous.attempt));
+            }
+            const watermark = Math.max(version(next.no_win_version), version(previous.no_win_version));
+            if (watermark) next.no_win_version = watermark;
+            if (watermark >= version(next.display_version) && watermark > 0) {
+                next.state = "no_win";
+                next.packet = null;
+                next.missing_reasons = {team: "no_win", weapon: "no_win"};
+            }
+            return next;
+        }
+
+        function createRankingDisplayPoller(options) {
+            let active = false, stopped = false, generation = 0, timer = null, pending = null, scheduledDelay = 0, waitingForTargets = true;
+            let failures = 0, rangeCursor = 0;
+            const cursors = new Map();
+            const cancelTimer = () => { if (timer !== null) options.cancelSchedule(timer); timer = null; };
+            const schedule = delay => {
+                cancelTimer();
+                scheduledDelay = delay;
+                if (active && !stopped) timer = options.schedule(() => { timer = null; tick(); }, delay);
+            };
+            async function tick() {
+                if (!active || stopped || pending || (timer !== null && scheduledDelay > 0 && !waitingForTargets)) return;
+                cancelTimer();
+                const context = options.getContext();
+                if (!context || !context.visible || context.tab === "peak-game" || !context.timestamp) {
+                    schedule(15000); return;
+                }
+                const groups = new Map();
+                for (const target of context.targets || []) {
+                    if (!Number.isSafeInteger(target.rank) || target.rank < 1) continue;
+                    if (!groups.has(target.range)) groups.set(target.range, new Set());
+                    groups.get(target.range).add(target.rank);
+                }
+                const ranges = [...groups.keys()];
+                if (!ranges.length) { waitingForTargets = true; schedule(15000); return; }
+                waitingForTargets = false;
+                const range = ranges[rangeCursor++ % ranges.length];
+                const all = [...groups.get(range)].sort((a, b) => a - b);
+                const last = cursors.get(range) || 0;
+                const ordered = [...all.filter(rank => rank > last), ...all.filter(rank => rank <= last)];
+                const ranks = ordered.slice(0, 100);
+                cursors.set(range, ranks[ranks.length - 1]);
+                const ownGeneration = generation;
+                const controller = new AbortController();
+                pending = controller;
+                try {
+                    const data = await options.fetchBatch({timestamp: context.timestamp, range, ranks, signal: controller.signal});
+                    const now = options.getContext();
+                    if (!active || generation !== ownGeneration || !now.visible || now.timestamp !== context.timestamp
+                        || now.tab !== context.tab || controller.signal.aborted) return;
+                    if (String(data.timestamp) !== String(context.timestamp) || data.range !== range) throw new Error("资料响应不匹配");
+                    options.applyBatch(data);
+                    failures = 0;
+                    if (data.overlay_enabled === false) stopped = true;
+                } catch (error) {
+                    if (active && generation === ownGeneration && !controller.signal.aborted) {
+                        failures++;
+                        options.onError(error);
+                    }
+                } finally {
+                    pending = null;
+                    if (generation === ownGeneration) schedule(Math.min(60000, 15000 * (2 ** Math.min(Math.max(failures - 1, 0), 2))));
+                    else if (active && !stopped) schedule(0);
+                }
+            }
+            return {
+                activate() { active = true; stopped = false; failures = 0; cancelTimer(); tick(); },
+                suspend() { active = false; generation++; cancelTimer(); if (pending) pending.abort(); },
+                tick,
+            };
+        }
+
+        function freezeRankingDisplayExport(members, records) {
+            return (members || []).map(member => applyRankingDisplay(member, records.get(member.rank)));
+        }
+
+        function renderRankingDisplay(member, item) {
+            if (member.equipment_source === "local_win_v2" || member.local_win_packet) return renderLocalEquipmentDisplay(member);
+            const shown = applyRankingDisplay(member, item);
+            const icons = [];
+            if (shown.weapon_icon) icons.push(`<img class="detail-weapon${isLegendaryWeapon(shown) ? " is-legendary" : ""}" src="${escapeHtml(shown.weapon_icon)}" alt="weapon" title="${escapeHtml(shown.weapon_name || "武器")}">`);
+            const selfId = shown.self_kungfu_id || resolveRankingKungfuIconId(shown);
+            if (selfId) icons.push(`<img class="detail-kungfu${isLegendaryWeapon(shown) ? " is-legendary" : ""}" src="https://img.jx3box.com/image/xf/${escapeHtml(selfId)}.png" alt="kungfu">`);
+            for (const mate of shown.teammates || []) {
+                if (mate && mate.kungfu_id) icons.push(`<span class="detail-kungfu-wrap" data-tooltip="${escapeHtml(mate.role_name || "未知")}"><img class="detail-kungfu${isLegendaryWeapon(mate) ? " is-legendary" : ""}" src="https://img.jx3box.com/image/xf/${escapeHtml(mate.kungfu_id)}.png" alt="teammate"></span>`);
+            }
+            const packet = item?.packet || (member.kungfu_acquisition === "live" && (!item || item.state === "unavailable") ? member.display_packet : null);
+            const state = item?.state;
+            let note = "";
+            if (packet && [undefined, "available", "partial", "unavailable"].includes(state)) {
+                note = `最近胜场配置 · 比赛 ${formatTime(packet.match_time)}`;
+                if (!packet.team_ready) note += " · 队友资料缺失";
+                if (!packet.weapon_ready) note += " · 武器资料缺失";
+            } else if (state === "no_win") note = "最近胜场配置：近期无胜场";
+            else if (state === "expired") note = "最近胜场配置：资料已过期";
+            else if (member.kungfu_acquisition === "cache") note = "最近胜场配置：暂无资料";
+            if (item?.attempt?.state === "failed" || (item?.attempt?.error_code && item.attempt.state !== "full")) note += `${note ? " · " : ""}最近更新失败`;
+            if (item?.read_failed) note += `${note ? " · " : ""}资料检查失败`;
+            return `<span class="detail-kungfu-row">${icons.join("")}</span>${note ? `<span class="ranking-display-note muted">${escapeHtml(note)}</span>` : ""}`;
+        }
+        // END RANKING DISPLAY HELPERS
+
+        function rankingDisplayRecords() {
+            const key = String(currentStatsTimestamp);
+            if (!rankingDisplaySnapshots.has(key)) rankingDisplaySnapshots.set(key, new Map());
+            return rankingDisplaySnapshots.get(key);
+        }
+
+        function rememberRankingDisplayMembers(members) {
+            for (const member of members || []) rankingDisplayMembers.set(member.rank, member);
+        }
+
+        function getRankingDisplayContext() {
+            const visible = document.visibilityState === "visible" && rankingDisplayExportDepth === 0
+                && currentStats?.ranking_display_kind === "current";
+            const targets = new Set();
+            if (visible && !isPeakTab(currentOuterTab)) {
+                for (const node of grid.querySelectorAll(".ranking-display[data-display-rank]")) {
+                    const details = node.closest("details");
+                    if (details && !details.open) continue;
+                    const rect = node.getBoundingClientRect();
+                    if (!node.getClientRects().length || rect.bottom <= 0 || rect.top >= window.innerHeight
+                        || rect.right <= 0 || rect.left >= window.innerWidth) continue;
+                    const rank = Number(node.dataset.displayRank);
+                    const member = rankingDisplayMembers.get(rank);
+                    if (member && ["cache", "live"].includes(member.kungfu_acquisition)
+                        && Number.isSafeInteger(member.kungfu_publish_version) && member.kungfu_publish_version > 0) targets.add(rank);
+                }
+            }
+            // All ranges contain the same frozen role at a given original rank.
+            // Query once in the largest saved range, then update its visible copies.
+            const range = rangeConfigs.find(config => currentStats?.kungfu_statistics?.[config.key])?.key;
+            return {timestamp: String(currentStatsTimestamp), tab: currentOuterTab, visible,
+                targets: [...targets].map(rank => ({range, rank}))};
+        }
+
+        function refreshRankingDisplayNodes(ranks) {
+            const records = rankingDisplayRecords();
+            for (const node of grid.querySelectorAll(".ranking-display[data-display-rank]")) {
+                const rank = Number(node.dataset.displayRank);
+                if (ranks && !ranks.has(rank)) continue;
+                const raw = rankingDisplayMembers.get(rank);
+                if (!raw) continue;
+                const markup = renderRankingDisplay(raw, records.get(rank));
+                if (node.innerHTML !== markup) node.innerHTML = markup;
+            }
+        }
+
+        function applyRankingDisplayBatch(data) {
+            if (String(data.timestamp) !== String(currentStatsTimestamp) || rankingDisplayExportDepth) return;
+            const records = rankingDisplayRecords();
+            if (data.overlay_enabled === false) {
+                records.clear();
+                refreshRankingDisplayNodes();
+                return;
+            }
+            const changed = new Set();
+            for (const item of data.items || []) {
+                const merged = mergeRankingDisplay(records.get(item.rank), item, data.checked_at);
+                if (merged) { delete merged.read_failed; records.set(item.rank, merged); changed.add(item.rank); }
+            }
+            refreshRankingDisplayNodes(changed);
+        }
+
+        function markRankingDisplayReadFailure() {
+            const records = rankingDisplayRecords();
+            const targets = getRankingDisplayContext().targets;
+            for (const {rank} of targets) records.set(rank, {...(records.get(rank) || {state: "unavailable"}), read_failed: true});
+            refreshRankingDisplayNodes(new Set(targets.map(target => target.rank)));
+        }
+
+        function startRankingDisplayExport() {
+            rankingDisplayExportDepth++;
+            suspendRankingDisplays();
+            rankingDisplayFrozenExport = freezeRankingDisplayExport([...rankingDisplayMembers.values()], rankingDisplayRecords());
+        }
+
+        function finishRankingDisplayExport() {
+            rankingDisplayExportDepth = Math.max(0, rankingDisplayExportDepth - 1);
+            if (!rankingDisplayExportDepth) { rankingDisplayFrozenExport = null; activateRankingDisplays(); }
+        }
+
+        function renderDetailContent(members, records = new Map()) {
             const filteredMembers = currentOuterTab === "purple"
                 ? (members || []).filter((member) => !isLegendaryWeapon(member))
                 : (members || []);
@@ -2352,24 +2829,7 @@
             }
 
             return filteredMembers.map((member) => {
-                const kungfuIcons = [];
-                if (member.kungfu_id) {
-                    const isLegendary = isLegendaryWeapon(member);
-                    kungfuIcons.push(`<img class="detail-kungfu${isLegendary ? " is-legendary" : ""}" src="https://img.jx3box.com/image/xf/${member.kungfu_id}.png" alt="kungfu">`);
-                }
-                if (Array.isArray(member.teammates)) {
-                    member.teammates.forEach((teammate) => {
-                        if (teammate && teammate.kungfu_id) {
-                            const isLegendary = isLegendaryWeapon(teammate);
-                            const teammateName = teammate.role_name ?? "未知";
-                            const tooltip = `${teammateName}`;
-                            kungfuIcons.push(`<span class="detail-kungfu-wrap" data-tooltip="${escapeHtml(tooltip)}"><img class="detail-kungfu${isLegendary ? " is-legendary" : ""}" src="https://img.jx3box.com/image/xf/${teammate.kungfu_id}.png" alt="teammate"></span>`);
-                        }
-                    });
-                }
-                const kungfuRow = kungfuIcons.length
-                    ? `<div class="detail-kungfu-row">${kungfuIcons.join("")}</div>`
-                    : "";
+                const kungfuRow = renderRankingDisplay(member, records.get(member.rank));
                 return `
                     <button
                         class="detail-item detail-item-btn"
@@ -2378,15 +2838,15 @@
                         data-role-name="${escapeHtml(member.name ?? "")}"
                         data-game-role-id="${escapeHtml(member.game_role_id ?? "")}"
                         data-global-role-id="${escapeHtml(member.global_role_id ?? "")}"
+                        data-global-id="${escapeHtml(member.global_id ?? "")}"
                         data-role-id="${escapeHtml(member.role_id ?? "")}"
                         data-zone="${escapeHtml(member.zone ?? "")}"
                     >
                         <div class="detail-rank">#${member.rank ?? "-"}</div>
                         <div class="detail-name">
-                            ${member.weapon_icon ? `<img class="detail-weapon${isLegendaryWeapon(member) ? " is-legendary" : ""}" src="${escapeHtml(member.weapon_icon)}" alt="weapon">` : ""}
                             <div>
                                 <div>${escapeHtml(member.name ?? "未知")}·${escapeHtml(member.server ?? "未知")}</div>
-                                ${kungfuRow}
+                                <span class="ranking-display" data-display-rank="${escapeHtml(member.rank ?? "")}">${kungfuRow}</span>
                             </div>
                         </div>
                         <div class="detail-score">${member.score ?? "-"}</div>
@@ -2412,11 +2872,23 @@
                 return;
             }
 
+            if (equipmentViewState?.current && !isPeakTab(currentOuterTab)) {
+                const members = equipmentAPI.visibleMembers(equipmentViewState.current, rangeKey, currentOuterTab)
+                    .filter(member => member.lane === lane && (member.kungfu || "未知") === kungfu);
+                detailListNode.innerHTML = renderDetailContent(members);
+                detailListNode.dataset.loaded = "true";
+                return;
+            }
             const detailSource = currentOuterTab === "peak-game" ? "peak-game" : "ranking";
+            const anchor = currentStatsTimestamp;
+            const tab = currentOuterTab;
             const cacheKey = buildDetailsCacheKey(detailSource, currentStatsTimestamp, rangeKey, lane, kungfu);
             if (detailCache.has(cacheKey)) {
-                detailListNode.innerHTML = renderDetailContent(detailCache.get(cacheKey) || []);
+                const cachedMembers = detailCache.get(cacheKey) || [];
+                if (detailSource === "ranking") rememberRankingDisplayMembers(cachedMembers);
+                detailListNode.innerHTML = renderDetailContent(cachedMembers, detailSource === "ranking" ? rankingDisplayRecords() : new Map());
                 detailListNode.dataset.loaded = "true";
+                activateRankingDisplays();
                 return;
             }
 
@@ -2433,11 +2905,16 @@
                 const data = unwrapResponse(payload);
                 const members = Array.isArray(data.members) ? data.members : [];
                 detailCache.set(cacheKey, members);
-                detailListNode.innerHTML = renderDetailContent(members);
+                if (currentStatsTimestamp !== anchor || currentOuterTab !== tab || !detailsNode.isConnected || !detailsNode.open) return;
+                if (detailSource === "ranking") rememberRankingDisplayMembers(members);
+                detailListNode.innerHTML = renderDetailContent(members, detailSource === "ranking" ? rankingDisplayRecords() : new Map());
                 detailListNode.dataset.loaded = "true";
+                activateRankingDisplays();
             } catch (error) {
+                if (currentStatsTimestamp !== anchor || currentOuterTab !== tab || !detailsNode.isConnected) return;
                 detailListNode.innerHTML = `<div class='muted error'>加载明细失败：${escapeHtml(error.message || error)}</div>`;
                 detailListNode.dataset.loaded = "false";
+                activateRankingDisplays();
             }
         }
 
@@ -2475,6 +2952,12 @@
         }
 
         function renderKungfuCoverage(stats) {
+            if (stats.equipment_source === "local_win_v2") {
+                const metrics = stats.source_equipment_metrics || stats.equipment_metrics || {};
+                const coverage = metrics.equipment_coverage == null ? "--" : `${(metrics.equipment_coverage*100).toFixed(1)}%`;
+                const cache = stats.kungfu_cache || {};
+                return `心法覆盖 ${((cache.coverage || 0)*100).toFixed(1)}% · 装备覆盖 ${coverage} · 装备未知 ${metrics.U || 0}`;
+            }
             const cache = stats.kungfu_cache;
             if (!cache) return "心法覆盖率未记录";
             const coverage = (Number(cache.coverage || 0) * 100).toFixed(1);
@@ -2616,15 +3099,33 @@
 
         function resolveKungfuIconId(playerOrName) {
             if (playerOrName && typeof playerOrName === "object") {
+                // Legacy ranking snapshots may contain swapped Tangmen or Fenshan/Xiaochen IDs.
+                const name = String(playerOrName.kungfu || playerOrName.kungfu_name || "").trim();
+                if (["天罗诡道", "惊羽诀", "分山劲", "笑尘诀"].includes(name)) return kungfuIconIdByName[name];
                 const directId = playerOrName.kungfu_id || playerOrName.kungfuId;
                 if (directId !== undefined && directId !== null && String(directId).trim()) {
                     return String(directId).trim();
                 }
-                const name = String(playerOrName.kungfu || playerOrName.kungfu_name || "").trim();
                 return kungfuIconIdByName[name] || "";
             }
             const name = String(playerOrName || "").trim();
             return kungfuIconIdByName[name] || "";
+        }
+
+        function resolveRankingKungfuIconId(member) {
+            // Classification fallback uses the corrected catalog. Legacy snapshots
+            // with match equipment/team predate self_kungfu_id and retain their match ID.
+            const source = member?.kungfu_source || member?.kungfu_selected_source;
+            const derived = source === "direct_legacy" || (["indicator", "match_history"].includes(source)
+                && Number.isInteger(member?.kungfu_publish_version) && member.kungfu_publish_version > 0);
+            const legacyMatch = !member?.kungfu_acquisition && !derived
+                && (member?.weapon_icon || member?.teammates?.length);
+            const directId = member?.kungfu_id || member?.kungfuId;
+            if (legacyMatch && directId !== undefined && directId !== null && String(directId).trim()) {
+                return String(directId).trim();
+            }
+            const name = String(member?.kungfu || member?.kungfu_name || "").trim();
+            return kungfuIconIdByName[name] || resolveKungfuIconId(member);
         }
 
         function renderTeamKungfuIconsInline(players) {
@@ -2654,27 +3155,29 @@
             return normalizeDetailPlayerName(name, server || "").trim();
         }
 
-        function findPeakSelfPlayer(summary, name, server) {
-            if (!summary || typeof summary !== "object") {
-                return null;
-            }
-            const teams = ["team1", "team2"];
+
+        function findDisplaySelfPlayer(players, name, server) {
+            // This only selects a display row. It never changes a request name or identity.
             const targetName = String(name || "").trim();
             const targetServer = String(server || "").trim();
-            for (const teamKey of teams) {
-                const players = summary[teamKey] && Array.isArray(summary[teamKey].players)
-                    ? summary[teamKey].players
-                    : [];
-                for (const player of players) {
-                    const roleName = normalizePlayerNameForCompare(player && player.role_name, player && player.server);
-                    const rawRoleName = String((player && player.role_name) || "").trim();
-                    const serverName = String((player && player.server) || "").trim();
-                    if ((roleName === targetName || rawRoleName === targetName) && serverName === targetServer) {
-                        return { player, teamKey };
-                    }
-                }
-            }
-            return null;
+            if (!targetName || !targetServer) return null;
+            const candidates = (players || []).filter(player => player
+                && String(player.server || "").trim() === targetServer);
+            const exact = candidates.find(player => String(player.role_name || "").trim() === targetName);
+            if (exact) return exact;
+            const labels = new Set([`${targetName}·${targetServer}`, `${targetName}@${targetServer}`]);
+            const displayed = candidates.filter(player => labels.has(String(player.role_name || "").trim()));
+            return displayed.length === 1 ? displayed[0] : null;
+        }
+
+        function findPeakSelfPlayer(summary, name, server) {
+            if (!summary || typeof summary !== "object") return null;
+            const candidates = ["team1", "team2"].flatMap(teamKey => {
+                const players = Array.isArray(summary[teamKey]?.players) ? summary[teamKey].players : [];
+                return players.map(player => ({player, teamKey}));
+            });
+            const self = findDisplaySelfPlayer(candidates.map(item => item.player), name, server);
+            return candidates.find(item => item.player === self) || null;
         }
 
         function resolveRankingItemKungfuIconId(item, name, server) {
@@ -2749,8 +3252,9 @@
             if (isPeakTab(outerTab)) {
                 syncScopeInlineText();
             }
-            const stats = outerTab === "purple"
-                ? buildFilteredStats(statsPayload.kungfu_statistics || {}, "purple")
+            const stats = equipmentViewState?.current && !isPeakTab(outerTab)
+                ? equipmentAPI.equipmentStatistics(equipmentViewState.current, outerTab)
+                : outerTab === "purple" ? buildFilteredStats(statsPayload.kungfu_statistics || {}, "purple")
                 : (statsPayload.kungfu_statistics || {});
             const cards = rangeConfigs
                 .filter((config) => stats[config.key])
@@ -2818,6 +3322,7 @@
             }
             const items = Array.isArray(payload.items) ? payload.items : [];
             const isPeak = isPeakTab(outerTab);
+            if (!isPeak) rememberRankingDisplayMembers(items);
             const rangeLabel = (rangeConfigs.find((item) => item.key === rangeKey) || {}).label || rangeKey;
             const titleLabel = getOuterTabLabel(outerTab);
             const metaParts = [];
@@ -2851,13 +3356,14 @@
                                 data-role-name="${escapeHtml(name)}"
                                 data-game-role-id="${escapeHtml(item.game_role_id ?? "")}"
                                 data-global-role-id="${escapeHtml(item.global_role_id ?? "")}"
+                                data-global-id="${escapeHtml(item.global_id ?? "")}"
                                 data-role-id="${escapeHtml(item.role_id ?? "")}"
                                 data-zone="${escapeHtml(item.zone ?? "")}"
                             >${escapeHtml(nameDisplay)}</button>
                         </span>
                         <span class="ranking-kungfu-cell">${kungfuIcon}${escapeHtml(kungfu)}</span>
                         <span class="ranking-score">${escapeHtml(score)}</span>
-                        <span>${matchSummary}</span>
+                        <span>${matchSummary}${!isPeak ? `<span class="ranking-display" data-display-rank="${escapeHtml(item.rank ?? "")}">${renderRankingDisplay(item, rankingDisplayRecords().get(item.rank))}</span>` : ""}</span>
                     </div>
                 `;
             }).join("");
@@ -2882,6 +3388,7 @@
                     </div>
                 </div>
             `;
+            if (!isPeak) activateRankingDisplays();
         }
 
         function renderIncompleteEquipmentNotice() {
@@ -2889,6 +3396,10 @@
         }
 
         async function loadRankingListView(outerTab, rangeKey) {
+            if (equipmentViewState?.current && !isPeakTab(outerTab)) {
+                const items = equipmentAPI.visibleMembers(equipmentViewState.current, rangeKey, outerTab);
+                renderListView({items, total: items.length}, outerTab, rangeKey); return;
+            }
             const range = currentStats?.kungfu_statistics?.[rangeKey];
             if (outerTab === "purple" && hasIncompleteEquipment(range?.healer, range?.dps)) {
                 renderIncompleteEquipmentNotice();
@@ -2899,6 +3410,8 @@
                 return;
             }
             const sourceConfig = getListSourceConfig(outerTab);
+            const anchor = currentStatsTimestamp;
+            const view = currentInnerView;
             const url = sourceConfig.api === "flat-members"
                 ? buildFlatMembersUrl(currentStatsTimestamp, rangeKey)
                 : buildPeakScoreUrl(currentStatsTimestamp, sourceConfig.scoreType, rangeKey);
@@ -2916,9 +3429,11 @@
                 const payload = await response.json();
                 const data = unwrapResponse(payload);
                 rankingListCache.set(cacheKey, data);
+                if (currentStatsTimestamp !== anchor || currentOuterTab !== outerTab || currentInnerView !== view) return;
                 renderListView(data, outerTab, rangeKey);
                 setStatus("列表加载完成");
             } catch (error) {
+                if (currentStatsTimestamp !== anchor || currentOuterTab !== outerTab || currentInnerView !== view) return;
                 grid.innerHTML = `<div class='range-card muted error'>加载列表失败：${escapeHtml(error.message || error)}</div>`;
             }
         }
@@ -2936,6 +3451,8 @@
         }
 
         function renderCurrentView() {
+            suspendRankingDisplays();
+            if (!equipmentCommitting) queueMicrotask(() => activateRankingDisplays());
             syncOuterTabUI();
             syncInnerViewUI();
             syncScopeInlineText();
@@ -2943,6 +3460,11 @@
                 toggleContainer.classList.toggle("hidden", currentInnerView !== "distribution");
             }
 
+            if (!isPeakTab(currentOuterTab) && equipmentViewState?.manifest && !equipmentViewState.current) {
+                showEquipmentPending(equipmentViewState.failed ? "完整装备数据读取失败，稍后重试" : "正在读取完整装备数据...",
+                    equipmentViewState.failed);
+                return;
+            }
             if (currentInnerView === "distribution") {
                 if (isPeakTab(currentOuterTab)) {
                     loadPeakDistributionView();
@@ -2990,7 +3512,7 @@
         function buildReadUrl(timestamp) {
             const hasQuery = readApiBase.includes("?");
             const joiner = hasQuery ? "&" : "?";
-            return `${readApiBase}${joiner}timestamp=${encodeURIComponent(timestamp)}`;
+            return `${readApiBase}${joiner}timestamp=${encodeURIComponent(timestamp)}&equipment_contract=2`;
         }
 
         function buildSeasonHistoryUrl(season) {
@@ -3006,7 +3528,14 @@
                 return;
             }
             const requestId = ++statsRequestId;
+            pauseEquipmentBootstrapReload(true);
+            suspendRankingDisplays();
+            rankingDisplayMembers.clear();
+            rankingDisplaySnapshots.clear();
+            currentStats = null;
+            equipmentViewState = null; equipmentFrozenPayload = null; equipmentStopped = false;
             currentStatsTimestamp = String(timestamp);
+            showEquipmentPending("正在读取完整排行榜资料...");
             setStatus(`请求接口：${buildReadUrl(timestamp)}`);
             try {
                 const response = await fetch(buildReadUrl(timestamp), { cache: "no-store" });
@@ -3017,8 +3546,8 @@
                 if (requestId !== statsRequestId) {
                     return;
                 }
-                render(unwrapResponse(payload));
-                setStatus("数据加载完成");
+                const data = unwrapResponse(payload);
+                adoptEquipmentBootstrap(data);
             } catch (error) {
                 if (requestId === statsRequestId) {
                     setStatus(`获取统计失败：${error.message || error}`, "error");
@@ -3027,6 +3556,9 @@
         }
 
         async function loadSeasonHistory(season) {
+            pauseEquipmentBootstrapReload(true);
+            suspendRankingDisplays();
+            const retainedAnchor = currentStatsTimestamp;
             const requestId = ++seasonHistoryRequestId;
             ++statsRequestId;
             setSeasonHistoryLoading();
@@ -3049,6 +3581,10 @@
                 if (requestId === seasonHistoryRequestId) {
                     restoreLoadedSeasonControls();
                     setStatus(`获取赛季历史失败：${error.message || error}`, "error");
+                }
+            } finally {
+                if (requestId === seasonHistoryRequestId && currentStats && currentStatsTimestamp === retainedAnchor) {
+                    activateRankingDisplays();
                 }
             }
         }
@@ -3243,12 +3779,13 @@
             return `对局列表：${cache.hit ? "缓存于" : "刚更新于"} ${formatTime(cache.cached_at)}`;
         }
 
+
         function renderIndicatorCacheLabel(indicatorData) {
             const cache = indicatorData && indicatorData.cache;
-            if (!cache || !cache.cached_at) {
-                return "";
-            }
-            return `赛季战绩：${cache.hit ? "缓存于" : "刚更新于"} ${formatTime(cache.cached_at)}`;
+            if (!cache || !cache.cached_at) return "";
+            const originalTime = formatTime(cache.cached_at);
+            if (cache.stale === true) return `赛季战绩：缓存于 ${originalTime}；刷新失败，使用旧数据`;
+            return `赛季战绩：${cache.hit ? "缓存于" : "刚更新于"} ${originalTime}`;
         }
 
         function updateRoleOverviewIndicator(indicatorData) {
@@ -3340,19 +3877,10 @@
             return `<div class="team-kungfu-icons">${icons.join("")}</div>`;
         }
 
+
         function normalizeDetailPlayerName(name, server) {
-            const rawName = String(name || "").trim();
-            const serverName = String(server || "").trim();
-            if (!rawName || !serverName) {
-                return rawName;
-            }
-            for (const separator of ["·", "@"]) {
-                const suffix = `${separator}${serverName}`;
-                if (rawName.endsWith(suffix)) {
-                    return rawName.slice(0, -suffix.length).trim();
-                }
-            }
-            return rawName;
+            // Names from a view remain intact; only the backend resolves display suffixes.
+            return String(name || "").trim();
         }
 
         function renderTeam(team, focusPlayer) {
@@ -3360,6 +3888,7 @@
                 return "<div class='modal-empty'>暂无队伍数据</div>";
             }
             const players = Array.isArray(team.players_info) ? team.players_info : [];
+            const displayFocus = focusPlayer ? findDisplaySelfPlayer(players, focusPlayer.name, focusPlayer.server) : null;
             return `
                 <div class="team-card ${team.won ? "won" : ""}">
                     <div class="team-title-row">
@@ -3370,9 +3899,7 @@
                         ${players.map((player) => {
                             const playerServer = String(player.server || "").trim();
                             const playerName = normalizeDetailPlayerName(player.role_name, playerServer);
-                            const isFocus = focusPlayer
-                                && playerName === focusPlayer.name
-                                && playerServer === focusPlayer.server;
+                            const isFocus = player === displayFocus;
                             const canNavigate = Boolean(playerName && playerServer);
                             return `
                                 <div
@@ -3458,180 +3985,177 @@
             `;
         }
 
-        async function fetchRoleIndicator(server, name, identityHints, cacheKey, forceRefresh = false) {
+
+        function cancelRoleRequests() {
+            if (currentRoleInspect) currentRoleInspect.controller.abort();
+            currentRoleInspect = null;
+            currentPagination = {hasMore: false, nextCursor: null, server: "", name: "", identityHints: {}, isLoading: false};
+        }
+
+        function isCurrentRoleView(view) {
+            return Boolean(view && currentRoleInspect === view && !view.controller.signal.aborted
+                && roleModal.classList.contains("show"));
+        }
+
+        function roleQueryFailureMessage(error) {
+            if (["query_timeout", "indicator_query_timeout"].includes(error?.message) || error?.name === "TimeoutError") return "请求超时，请稍后重试";
+            if (["query_busy", "indicator_query_busy"].includes(error?.message)) return "查询繁忙，请稍后重试";
+            if (error?.message === "indicator_storage_unavailable") return "查询失败：存储暂不可用，请稍后重试";
+            if (error?.message === "indicator_unavailable") return "战绩获取失败，请稍后重试";
+            return error?.message || "查询失败，请稍后重试";
+        }
+
+        async function fetchRoleQuery(url, view) {
+            const controller = new AbortController();
+            const abortView = () => controller.abort();
+            if (!isCurrentRoleView(view)) throw new DOMException("View closed", "AbortError");
+            view.controller.signal.addEventListener("abort", abortView, {once: true});
+            let timedOut = false;
+            const timer = window.setTimeout(() => { timedOut = true; controller.abort(); }, 11000);
             try {
-                const response = await fetch(
-                    buildRoleIndicatorUrl(server, name, identityHints, { forceRefresh }),
-                    { cache: "no-store" },
-                );
-                if (response.ok) {
-                    const payload = await response.json();
-                    const data = unwrapResponse(payload);
-                    roleIndicatorCache.set(cacheKey, { fetchedAt: Date.now(), data });
-                    updateRoleOverviewIndicator(data);
-                    return data;
-                } else {
-                    const data = { error: true, message: "indicator_unavailable" };
-                    updateRoleOverviewIndicator(data);
-                    return data;
+                const response = await fetch(url, {cache: "no-store", signal: controller.signal});
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = unwrapResponse(await response.json());
+                // Also reject a late fulfilled response from an already-aborted view.
+                if (timedOut) throw new Error("query_timeout");
+                if (!isCurrentRoleView(view)) throw new DOMException("View closed", "AbortError");
+                return data;
+            } catch (error) {
+                if (timedOut) throw new Error("query_timeout");
+                throw error;
+            } finally {
+                window.clearTimeout(timer);
+                view.controller.signal.removeEventListener("abort", abortView);
+            }
+        }
+
+        async function fetchRoleIndicator(server, name, identityHints, cacheKey, forceRefresh = false, view = currentRoleInspect) {
+            if (!isCurrentRoleView(view)) return null;
+            const generation = (view.indicatorGeneration || 0) + 1;
+            view.indicatorGeneration = generation;
+            const isCurrentRequest = () => isCurrentRoleView(view) && view.indicatorGeneration === generation;
+            try {
+                const data = await fetchRoleQuery(buildRoleIndicatorUrl(server, name, identityHints, {forceRefresh}), view);
+                if (!data || data.error || !data.indicator || typeof data.indicator !== "object" || Array.isArray(data.indicator)) {
+                    throw new Error("战绩数据格式异常");
                 }
-            } catch (e) {
-                const data = { error: true, message: "indicator_unavailable" };
+                if (!isCurrentRequest()) return null;
+                roleIndicatorCache.set(cacheKey, {fetchedAt: Date.now(), data});
                 updateRoleOverviewIndicator(data);
+                return data;
+            } catch (error) {
+                if (!isCurrentRequest()) return null;
+                const data = {error: true, message: roleQueryFailureMessage(error)};
+                if (!forceRefresh) updateRoleOverviewIndicator(data);
                 return data;
             }
         }
 
+
         async function refreshRoleIndicator() {
-            if (!currentRoleInspect || !currentRoleInspect.cacheKey) {
-                return;
-            }
+            const view = currentRoleInspect;
+            if (!isCurrentRoleView(view)) return;
             const button = document.getElementById("refresh-role-indicator-btn");
-            if (button) {
-                button.disabled = true;
-                button.textContent = "刷新中...";
-            }
-            const previous = roleIndicatorCache.get(currentRoleInspect.cacheKey)?.data || null;
-            const data = await fetchRoleIndicator(
-                currentRoleInspect.server,
-                currentRoleInspect.name,
-                currentRoleInspect.identityHints || {},
-                currentRoleInspect.cacheKey,
-                true,
-            );
-            if (data && data.error && previous && !previous.error) {
-                updateRoleOverviewIndicator(previous);
-                const cacheLabel = document.getElementById("role-indicator-cache-label");
-                if (cacheLabel) {
-                    cacheLabel.textContent = `刷新失败，保留${renderIndicatorCacheLabel(previous) || "现有数据"}`;
+            if (button) {button.disabled = true; button.textContent = "刷新中...";}
+            const previous = roleIndicatorCache.get(view.cacheKey)?.data || null;
+            const request = fetchRoleIndicator(view.server, view.name, view.identityHints, view.cacheKey, true, view);
+            const generation = view.indicatorGeneration;
+            const isCurrentRequest = () => isCurrentRoleView(view) && view.indicatorGeneration === generation;
+            try {
+                const data = await request;
+                if (!isCurrentRequest()) return;
+                if (data?.error) {
+                    if (previous && !previous.error) updateRoleOverviewIndicator(previous);
+                    else updateRoleOverviewIndicator(data);
+                    const label = document.getElementById("role-indicator-cache-label");
+                    if (label) label.textContent = `刷新失败：${data.message}；${previous ? `保留${renderIndicatorCacheLabel(previous) || "现有数据"}` : "请稍后重试"}`;
                 }
-            }
-            if (button) {
-                button.disabled = false;
-                button.textContent = "刷新战绩";
+            } finally {
+                if (isCurrentRequest() && button) {button.disabled = false; button.textContent = "刷新战绩";}
             }
         }
 
-        async function fetchRoleRecent(server, name, identityHints, cacheKey, forceRefresh = false) {
-            const response = await fetch(
-                buildRoleRecentUrl(server, name, identityHints, 0, { forceRefresh }),
-                { cache: "no-store" },
-            );
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
-            const recentPayload = await response.json();
-            const recentData = unwrapResponse(recentPayload);
-            roleRecentCache.set(cacheKey, { fetchedAt: Date.now(), data: recentData });
-            return recentData;
+
+        async function fetchRoleRecent(server, name, identityHints, cacheKey, forceRefresh = false, view = currentRoleInspect) {
+            const data = await fetchRoleQuery(buildRoleRecentUrl(server, name, identityHints, 0, {forceRefresh}), view);
+            if (!data || data.error || !data.player || !Array.isArray(data.recent_matches)) throw new Error("对局数据格式异常");
+            if (!isCurrentRoleView(view)) throw new DOMException("View closed", "AbortError");
+            roleRecentCache.set(cacheKey, {fetchedAt: Date.now(), data});
+            return data;
         }
+
 
         async function refreshRoleRecent() {
-            if (!currentRoleInspect || !currentRoleInspect.cacheKey) {
-                return;
-            }
+            const view = currentRoleInspect;
+            if (!isCurrentRoleView(view)) return;
             const button = document.getElementById("refresh-role-recent-btn");
-            if (button) {
-                button.disabled = true;
-                button.textContent = "刷新中...";
-            }
+            if (button) {button.disabled = true; button.textContent = "刷新中...";}
             try {
-                const recentData = await fetchRoleRecent(
-                    currentRoleInspect.server,
-                    currentRoleInspect.name,
-                    currentRoleInspect.identityHints || {},
-                    currentRoleInspect.cacheKey,
-                    true,
-                );
-                const cachedIndicator = roleIndicatorCache.get(currentRoleInspect.cacheKey);
-                const indicatorData = cachedIndicator ? cachedIndicator.data : null;
-                renderRoleRecentModal(recentData, false, indicatorData);
+                const data = await fetchRoleRecent(view.server, view.name, view.identityHints, view.cacheKey, true, view);
+                if (!isCurrentRoleView(view)) return;
+                renderRoleRecentModal(data, false, roleIndicatorCache.get(view.cacheKey)?.data || null);
             } catch (error) {
-                const cacheLabel = document.getElementById("role-recent-cache-label");
-                if (cacheLabel) {
-                    cacheLabel.textContent = `对局刷新失败：${error.message || error}`;
-                }
-                if (button) {
-                    button.disabled = false;
-                    button.textContent = "点击重试";
-                }
+                if (!isCurrentRoleView(view)) return;
+                const label = document.getElementById("role-recent-cache-label");
+                const previous = roleRecentCache.get(view.cacheKey)?.data;
+                if (label) label.textContent = `对局刷新失败：${roleQueryFailureMessage(error)}${previous ? `；保留${renderRoleRecentCacheLabel(previous)}` : ""}`;
+            } finally {
+                if (isCurrentRoleView(view) && button) {button.disabled = false; button.textContent = "刷新对局";}
             }
         }
 
+
         async function loadRoleRecent(server, name, identityHints = {}) {
-            const cacheKey = `${server}::${name}::${identityHints.global_role_id || ""}::${identityHints.game_role_id || ""}::${identityHints.zone || ""}`;
+            cancelRoleRequests();
+            const hints = {...identityHints};
+            const cacheKey = JSON.stringify([server, name, ...["global_id", "global_role_id", "game_role_id", "role_id", "zone"].map(key => hints[key] || "")]);
+            const view = {server, name, identityHints: hints, cacheKey, controller: new AbortController()};
+            currentRoleInspect = view;
             openModal(roleModal);
             roleModalTitle.textContent = `${name}·${server}`;
             roleModalSubtitle.textContent = "";
             roleModalBody.innerHTML = "<div class='modal-loading'>正在加载角色近期战绩...</div>";
-
             const cached = roleRecentCache.get(cacheKey);
             if (cached && Date.now() - cached.fetchedAt < 600000) {
-                currentRoleInspect = { server, name, identityHints, cacheKey };
-                const cachedIndicator = roleIndicatorCache.get(cacheKey);
-                const validIndicator = (cachedIndicator && Date.now() - cachedIndicator.fetchedAt < 86400000) ? cachedIndicator.data : null;
+                const indicator = roleIndicatorCache.get(cacheKey);
+                const validIndicator = indicator && Date.now() - indicator.fetchedAt < 86400000
+                    && indicator.data.cache?.stale !== true ? indicator.data : null;
                 renderRoleRecentModal(cached.data, false, validIndicator);
-                if (!validIndicator) {
-                    const indicatorRequest = fetchRoleIndicator(server, name, identityHints, cacheKey);
-                    indicatorRequest.catch(function () {});
-                }
+                if (!validIndicator) await fetchRoleIndicator(server, name, hints, cacheKey, false, view);
                 return;
             }
-
             try {
-                const indicatorRequest = fetchRoleIndicator(server, name, identityHints, cacheKey);
-                const [recentData, indicatorResponse] = await Promise.all([
-                    fetchRoleRecent(server, name, identityHints, cacheKey),
-                    indicatorRequest.catch(function () { return null; }),
+                const [recentData, indicatorData] = await Promise.all([
+                    fetchRoleRecent(server, name, hints, cacheKey, false, view),
+                    fetchRoleIndicator(server, name, hints, cacheKey, false, view),
                 ]);
-
-                var indicatorData = null;
-                if (indicatorResponse) {
-                    indicatorData = indicatorResponse;
-                } else {
-                    indicatorData = { error: true, message: "indicator_unavailable" };
-                }
-
-                currentRoleInspect = { server, name, identityHints, cacheKey };
-                renderRoleRecentModal(recentData, false, indicatorData);
+                if (!isCurrentRoleView(view)) return;
+                renderRoleRecentModal(recentData, false, indicatorData || {error: true, message: "战绩加载失败"});
             } catch (error) {
-                roleModalBody.innerHTML = `<div class='modal-loading error'>加载角色近期战绩失败：${escapeHtml(error.message || error)}</div>`;
+                if (!isCurrentRoleView(view)) return;
+                roleModalBody.innerHTML = `<div class='modal-loading error'>加载角色近期战绩失败：${escapeHtml(roleQueryFailureMessage(error))}</div>`;
             }
         }
 
-        async function loadMoreMatches() {
-            if (currentPagination.isLoading || !currentPagination.hasMore || currentPagination.nextCursor == null) {
-                return;
-            }
-            currentPagination.isLoading = true;
-            const loadMoreBtn = roleModalBody.querySelector("#load-more-btn");
-            if (loadMoreBtn) {
-                loadMoreBtn.textContent = "加载中...";
-                loadMoreBtn.classList.add("loading");
-                loadMoreBtn.disabled = true;
-            }
 
+        async function loadMoreMatches() {
+            const view = currentRoleInspect;
+            const pagination = currentPagination;
+            if (!isCurrentRoleView(view) || pagination.isLoading || !pagination.hasMore || pagination.nextCursor == null) return;
+            pagination.isLoading = true;
+            const button = roleModalBody.querySelector("#load-more-btn");
+            if (button) {button.textContent = "加载中..."; button.classList.add("loading"); button.disabled = true;}
             try {
-                const url = buildRoleRecentUrl(
-                    currentPagination.server,
-                    currentPagination.name,
-                    currentPagination.identityHints,
-                    currentPagination.nextCursor,
-                );
-                const response = await fetch(url, { cache: "no-store" });
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                const payload = await response.json();
-                const data = unwrapResponse(payload);
-                renderRoleRecentModal(data, true);
+                const data = await fetchRoleQuery(buildRoleRecentUrl(pagination.server, pagination.name, pagination.identityHints, pagination.nextCursor), view);
+                if (!data || data.error || !data.player || !Array.isArray(data.recent_matches)) throw new Error("对局数据格式异常");
+                if (isCurrentRoleView(view) && currentPagination === pagination) renderRoleRecentModal(data, true);
             } catch (error) {
-                if (loadMoreBtn) {
-                    loadMoreBtn.textContent = "加载失败，点击重试";
-                    loadMoreBtn.classList.remove("loading");
-                    loadMoreBtn.disabled = false;
+                if (isCurrentRoleView(view) && currentPagination === pagination && button) {
+                    button.textContent = `加载失败：${roleQueryFailureMessage(error)}，点击重试`;
+                    button.classList.remove("loading"); button.disabled = false;
                 }
-                currentPagination.isLoading = false;
+            } finally {
+                pagination.isLoading = false;
             }
         }
 
@@ -3665,6 +4189,10 @@
         }
 
         async function exportCardImage(card, label) {
+            if (equipmentExportPending()) {
+                setStatus("请等待完整排行榜资料加载完成后再导出", "error");
+                return;
+            }
             if (typeof window.html2canvas !== "function") {
                 setStatus("图片生成库未加载，请稍后重试", "error");
                 return;
@@ -3674,6 +4202,7 @@
             const modeSuffix = currentOuterTab === "purple" ? "_紫武" : "";
             const fileName = `${safeLabel}_${seasonLabel}_心法分布${modeSuffix}.png`;
             const openDetails = Array.from(card.querySelectorAll("details[open]"));
+            startRankingDisplayExport();
             try {
                 card.classList.add("is-exporting");
                 openDetails.forEach((detail) => detail.removeAttribute("open"));
@@ -3691,12 +4220,14 @@
             } finally {
                 openDetails.forEach((detail) => detail.setAttribute("open", ""));
                 card.classList.remove("is-exporting");
+                finishRankingDisplayExport();
             }
         }
 
         function buildDistributionExportMarkup(payload, exportTab, seasonText, rankingTimeText, overlayEnabled) {
-            const stats = exportTab === "purple"
-                ? buildFilteredStats(payload.kungfu_statistics || {}, "purple")
+            const stats = payload.equipment_view && equipmentAPI
+                ? equipmentAPI.equipmentStatistics(payload.equipment_view, exportTab)
+                : exportTab === "purple" ? buildFilteredStats(payload.kungfu_statistics || {}, "purple")
                 : (payload.kungfu_statistics || {});
             const ranges = rangeConfigs.filter((config) => stats[config.key]);
             if (!ranges.length) {
@@ -3766,6 +4297,10 @@
         let fullPageExportInProgress = false;
 
         async function exportFullPageImage(modeOverride) {
+            if (equipmentExportPending()) {
+                setStatus("请等待完整排行榜资料加载完成后再导出", "error");
+                return;
+            }
             if (fullPageExportInProgress) return;
             if (typeof window.html2canvas !== "function") {
                 setStatus("图片生成库未加载，请稍后重试", "error");
@@ -3790,6 +4325,7 @@
             const modeSuffix = exportTab === "purple" ? "_推栏排名-紫武" : exportTab === "peak-game" ? "_14日游戏最高分排名" : "_推栏排名";
             const fileName = `竞技场心法排名统计_${seasonLabel}_${rankingTimeLabel}${modeSuffix}.png`;
             fullPageExportInProgress = true;
+            startRankingDisplayExport();
             try {
                 setStatus("正在生成整页图片，请稍候");
                 const payload = exportTab === "peak-game" ? await getPeakDistributionStats(timestamp) : statsSnapshot;
@@ -3814,6 +4350,7 @@
                 setStatus(`生成整页图片失败：${error.message || error}`, "error");
             } finally {
                 fullPageExportInProgress = false;
+                finishRankingDisplayExport();
             }
         }
 
@@ -4037,12 +4574,34 @@
             });
         })();
 
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") activateRankingDisplays();
+            else suspendRankingDisplays();
+        });
+        window.addEventListener("pagehide", () => suspendRankingDisplays());
+        window.addEventListener("pageshow", () => activateRankingDisplays());
+        window.addEventListener("scroll", () => tickRankingDisplays(), {passive: true});
+        window.addEventListener("resize", () => tickRankingDisplays(), {passive: true});
+        grid.addEventListener("toggle", event => {
+            if (!event.target.matches("details.detail")) return;
+            if (equipmentViewState?.manifest && !isPeakTab(currentOuterTab)) {
+                // V2 polling belongs to the complete board. Expanding/folding
+                // only changes DOM, including toggle events restoring a commit.
+                if (event.target.open) ensureDetailLoaded(event.target);
+                return;
+            }
+            // Legacy per-card reads invalidate requests on a fold.
+            suspendRankingDisplays();
+            if (event.target.open) ensureDetailLoaded(event.target);
+            else activateRankingDisplays();
+        }, true);
+
         loadDateList();
 
         if (grid) {
             grid.addEventListener("click", (event) => {
                 const target = event.target;
-                if (!(target instanceof HTMLElement)) {
+                if (!(target instanceof Element)) {
                     return;
                 }
 
@@ -4075,6 +4634,7 @@
                         loadRoleRecent(server, name, {
                             game_role_id: memberButton.getAttribute("data-game-role-id") || "",
                             global_role_id: memberButton.getAttribute("data-global-role-id") || "",
+                            global_id: memberButton.getAttribute("data-global-id") || "",
                             role_id: memberButton.getAttribute("data-role-id") || "",
                             zone: memberButton.getAttribute("data-zone") || "",
                         });
@@ -4082,15 +4642,6 @@
                     return;
                 }
 
-                const summary = target.closest("summary");
-                if (summary) {
-                    const detailsNode = summary.closest(".detail");
-                    if (detailsNode instanceof HTMLElement) {
-                        window.requestAnimationFrame(() => {
-                            ensureDetailLoaded(detailsNode);
-                        });
-                    }
-                }
             });
         }
 

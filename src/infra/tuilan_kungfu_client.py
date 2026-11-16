@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from src.infra.http_client import HttpClient
 from src.utils.tuilan_request import build_tuilan_request
+from src.utils.jjc_display_identity import indicator_identity, needs_replay
 
 
 class KungfuQueryError(Exception):
@@ -30,8 +31,10 @@ class TuilanKungfuClient:
         self, *, clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         request_delay: Tuple[float, float] = (1, 3), request_timeout: float = 10,
-        attempt_timeout: float = 25, http_client: Optional[Any] = None,
+        attempt_timeout: Optional[float] = None, http_client: Optional[Any] = None,
+        display_enabled: bool = False,
     ) -> None:
+        attempt_timeout = attempt_timeout if attempt_timeout is not None else (60 if display_enabled else 25)
         if (len(request_delay) != 2 or not all(math.isfinite(value) for value in
                     (*request_delay, request_timeout, attempt_timeout))
                 or not 0 <= request_delay[0] <= request_delay[1]
@@ -43,6 +46,8 @@ class TuilanKungfuClient:
         self.http_client = http_client if http_client is not None else HttpClient(
             timeout=request_timeout, retries=0, verify=False)
         self._query_lock: Optional[asyncio.Lock] = None
+        self.display_enabled = display_enabled
+        self._deadline: Optional[float] = None
 
     async def query(self, identity: Dict[str, Any], scope: Dict[str, Any]) -> Dict[str, Any]:
         # Foreground misses and background refresh share the same request path.
@@ -52,11 +57,27 @@ class TuilanKungfuClient:
             self._query_lock = asyncio.Lock()
         async with self._query_lock:
             try:
+                if self.display_enabled:
+                    self._deadline = asyncio.get_running_loop().time() + self.attempt_timeout
+                    return await self._query(identity, scope)
                 return await asyncio.wait_for(self._query(identity, scope), self.attempt_timeout)
             except asyncio.TimeoutError as exc:
                 raise KungfuQueryError("attempt_timeout") from exc
+            finally:
+                self._deadline = None
 
     async def _request(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self._deadline is not None:
+            remaining = self._deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise KungfuQueryError("attempt_timeout")
+            try:
+                return await asyncio.wait_for(self._request_once(url, params), remaining)
+            except asyncio.TimeoutError as exc:
+                raise KungfuQueryError("attempt_timeout") from exc
+        return await self._request_once(url, params)
+
+    async def _request_once(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         # Match ranking lookups: wait a random 1–3 seconds before each request,
         # including the first request and requests for the next queued role.
         delay = random.uniform(*self.request_delay)
@@ -178,13 +199,77 @@ class TuilanKungfuClient:
                     raise KungfuQueryError("invalid_history")
                 matches = [row for row in rows[:40] if isinstance(row, dict)]
             except KungfuQueryError as exc:
-                if exc.auth or exc.code in ("rate_limited", "scope_mismatch"):
+                if not self.display_enabled and (exc.auth or exc.code in ("rate_limited", "scope_mismatch")):
                     raise
                 # Legacy selection falls back to indicator when history fails;
                 # auth/rate limits remain control signals and cannot be bypassed.
                 history_error = exc.code
+                history_failure = exc
         result = {"indicator_data": data, "matches": matches,
                   "requested_at": requested_at, "verified_at": self.clock()}
         if history_error:
             result["history_error_code"] = history_error
+        if self.display_enabled:
+            if history_error:
+                result["display_evidence"] = self._display_failure(history_failure)
+            elif not sk01.startswith("SK01-"):
+                result["display_evidence"] = self._display_failure(KungfuQueryError("missing_sk01"))
+            else:
+                result["display_evidence"] = await self._display(indicator_identity(identity, data), scope, matches)
+            result["verified_at"] = self.clock()
         return result
+
+    @staticmethod
+    def _display_failure(error: KungfuQueryError) -> Dict[str, Any]:
+        return {"status": "failed", "error_code": error.code,
+                "retry_after": error.retry_after, "auth": error.auth}
+
+    async def _display(self, identity: Dict[str, Any], scope: Dict[str, Any],
+                       matches: list) -> Dict[str, Any]:
+        candidates = []
+        missing_time = False
+        for row in matches:
+            if row.get("won") is not True:
+                continue
+            if any(row.get(key) is not None and str(row[key]) != str(scope.get(key))
+                   for key in ("season_id", "pvp_type")):
+                continue
+            try:
+                stamp = int(row.get("match_time") or row.get("matchTime") or
+                            row.get("start_time") or row.get("startTime") or row.get("time"))
+                match_id = int(row.get("match_id") or row.get("matchId") or row.get("id"))
+            except (TypeError, ValueError, OverflowError):
+                missing_time = True
+                continue
+            if stamp <= 0 or (stamp >= scope["season_start"] and match_id <= 0):
+                missing_time = True
+                continue
+            if stamp >= scope["season_start"] and match_id > 0:
+                candidates.append((stamp, match_id))
+        if not candidates:
+            return (self._display_failure(KungfuQueryError("invalid_match_locator")) if missing_time
+                    else {"status": "no_win"})
+        stamp, match_id = max(candidates)
+        evidence: Dict[str, Any] = {"status": "ready", "match_id": match_id, "match_time": stamp}
+        try:
+            detail = await self._request("https://m.pvp.xoyo.com/3c/mine/match/detail", {"match_id": match_id})
+            error = self._error(detail)
+            if error:
+                raise error
+            data = detail.get("data")
+            if not isinstance(data, dict):
+                raise KungfuQueryError("invalid_detail")
+            self._check_scope(data, scope)
+            evidence["detail_data"] = data
+            if needs_replay(data, identity):
+                replay = await self._request("https://m.pvp.xoyo.com/3c/mine/match/replay", {"match_id": match_id})
+                error = self._error(replay)
+                if error:
+                    raise error
+                if not isinstance(replay.get("data"), dict):
+                    raise KungfuQueryError("invalid_replay")
+                self._check_scope(replay["data"], scope)
+                evidence["replay_data"] = replay["data"]
+        except KungfuQueryError as exc:
+            evidence.update(self._display_failure(exc))
+        return evidence

@@ -430,3 +430,12 @@ curl -X POST "https://qike.rickchen.cn/jx3bot/api/jjc/ranking-stats/synced-role-
 回滚准备须在停止所有相关进程后执行：逐条读取队列，有 ranking_pending 的记录将其待执行窗口/赛季/source/batch 等字段合并到当前记录，置 queued，清 next_sync_after 和租约；将 queue_front_order、queue_front_rank、ranking_pending 统一清为 null，保留 ranking_request_order、比赛、水位及失败审计。先核对 pending 数与转换成功数一致、剩余 pending 为零，再切回旧版本恢复进程。没有 pending 的运行中任务沿用既有租约过期恢复。保留新增索引，不删除身份、队列、对局或旧索引。该转换已在隔离真实Mongo两队列演练通过，未执行生产回滚。
 
 本次私有发布目录为 `/mnt/sata6-1/jx3bot-releases/ranking-front-20261107-e1ee55ef4405/`。回滚须停止全部bot、独立worker、dispatcher、统计生产者和其他队列写者；临时容器只执行转换器，使用核对过的同镜像、网络、原环境及只读原配置，工作目录/PYTHONPATH为/app，核对目标Mongo配置指纹。preimage使用canonical Extended JSON逐条flush/fsync，写入宿主持久化可写挂载，限制权限并使用唯一新文件名。disabled不复活，保留较高人工priority。两队列pending/front残留为零、转换数与备份条数一致、退出码为0后才恢复旧allowlist源码并启动；异常/CAS失配保持停止，保留部分备份，重试换新文件名。脚本、日志、转换计数和哈希保留；就绪/API/QQ/worker检查后，仅撤销本次暂停，保留期间其他原因的暂停。详见归档change的deployment.md。
+
+
+### 排行榜本地最新胜场装备
+
+`JJC_RANKING_LOCAL_WIN_EQUIPMENT_ENABLED=1` 后，按稳定角色 ID 读取本地当前赛季最新一场 3v3 胜场，统一提供装备、队友、橙武统计和紫武筛选。取最新胜场后装备缺失时保留未知，不向更旧胜场回退；心法分类保留原有来源。默认值为 0，支持环境变量与私有 runtime_config.json，修改后重启。`JJC_RANKING_DISPLAY_QUERY_ENABLED` 与 `JJC_RANKING_DISPLAY_OVERLAY_ENABLED` 是既有资料查询和展示覆盖开关，各自默认 0。
+
+读服务使用专用 Mongo 连接和 singleflight，在原 1.5 秒 Mongo、2 秒 socket、8 秒构建、10 秒请求预算内完成整榜；超时或证据不一致时明确失败，不截断成员或丢弃异常证据。`JJC_EQUIPMENT_MONGO_HOST` 默认为空，仅在有明确部署需要时覆盖装备读连接的主机，凭据仍取部署配置。
+
+开启前必须完成主表派生字段回填、索引校验与全榜只读预检。字段、索引及回滚限制见 `docs/design-docs/database-design.md` 和 `docs/references/runbook.md`。方案与验证记录见 `openspec/changes/jjc-ranking-local-latest-match/`；独立提交包验证见其中 `submission.md`。
