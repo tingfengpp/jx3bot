@@ -1,3 +1,4 @@
+from src.infra.group_delivery import send_group_msg
 from typing import Dict, Any, List, Optional, Annotated
 import asyncio
 from nonebot import get_driver, on_regex, require,on_command
@@ -224,7 +225,7 @@ async def check_timeouts():
 
                     # 发送消息
                     if group_id:
-                        await _bot.send_group_msg(
+                        await send_group_msg(_bot,
                             group_id=group_id,
                             message=MessageSegment.at(user_id) + "查询结果\n" + MessageSegment.image(image_bytes)
                         )
@@ -237,7 +238,7 @@ async def check_timeouts():
                     # 没有结果，仅通知超时
                     group_id = data.get("group_id")
                     if group_id:
-                        await _bot.send_group_msg(
+                        await send_group_msg(_bot,
                             group_id=group_id,
                             message=MessageSegment.at(user_id) + "外观搜索会话已超时，请重新搜索"
                         )
@@ -857,7 +858,7 @@ async def check_price_alerts():
                     )
 
                     if sub.get("group_id"):
-                        await _bot.send_group_msg(
+                        await send_group_msg(_bot,
                             group_id=int(sub["group_id"]),
                             message=f"[CQ:at,qq={user_id}] {message}"
                         )

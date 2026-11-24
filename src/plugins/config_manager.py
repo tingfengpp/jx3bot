@@ -1,3 +1,4 @@
+from src.infra.group_delivery import send_group_msg
 import os
 import sys
 import json
@@ -267,7 +268,7 @@ async def handle_bot_connect(bot: Bot):
 
         if group_id:
             logger.info(f"准备向群{group_id}发送重启完成通知")
-            await bot.send_group_msg(group_id=int(group_id), message=message)
+            await send_group_msg(bot, group_id=int(group_id), message=message)
             logger.info(f"已向群{group_id}发送重启完成通知")
         elif user_id:
             logger.info(f"准备向用户{user_id}发送重启完成通知")

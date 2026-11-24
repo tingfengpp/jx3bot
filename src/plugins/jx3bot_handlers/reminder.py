@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.infra.group_delivery import send_group_msg
 
 import asyncio
 import time
@@ -180,7 +181,7 @@ async def _send_reminder(reminder_id: str) -> None:
         message = MessageSegment.at(user_id) + Message(f" {message_text}")
 
     try:
-        await _bot.send_group_msg(group_id=group_id, message=message)
+        await send_group_msg(_bot, group_id=group_id, message=message)
         await mark_reminder_done(reminder_id)
         logger.info(
             "提醒发送成功: "

@@ -1,3 +1,4 @@
+from src.infra.group_delivery import send_group_msg
 import asyncio
 import json
 import re
@@ -347,7 +348,7 @@ async def check_records():
                                     f"日期：{date}"
                                 )
 
-                                await bot.send_group_msg(group_id=int(gid), message=message)
+                                await send_group_msg(bot, group_id=int(gid), message=message)
                                 logger.info("status_monitor 向群{}推送技改: {}", gid, title)
                         except Exception as e:
                             logger.warning("status_monitor 向群{}推送技改失败: {}", gid, e)
@@ -418,7 +419,7 @@ async def check_news():
                                     f"日期：{date}"
                                 )
 
-                                await bot.send_group_msg(group_id=int(gid), message=message)
+                                await send_group_msg(bot, group_id=int(gid), message=message)
                                 logger.info("status_monitor 向群{}推送新闻: {}", gid, title)
                         except Exception as e:
                             logger.warning("status_monitor 向群{}推送新闻失败: {}", gid, e)
@@ -482,7 +483,7 @@ async def check_event_codes():
                                 if not isinstance(config, dict) or config.get("福利推送", False) is False:
                                     continue
 
-                                await bot.send_group_msg(group_id=int(gid), message=message)
+                                await send_group_msg(bot, group_id=int(gid), message=message)
                                 logger.info("status_monitor 向群{}推送活动码: {}", gid, title)
                             except Exception as e:
                                 logger.warning("status_monitor 向群{}推送活动码失败: {}", gid, e)
@@ -607,7 +608,7 @@ async def check_status():
                         if banben != "未知":
                             message += f"\n最新版本：{banben}"
 
-                        await bot.send_group_msg(group_id=int(gid), message=message)
+                        await send_group_msg(bot, group_id=int(gid), message=message)
                         logger.info("status_monitor 向群{}推送服务器状态变化: {}", gid, bound_server)
                         await asyncio.sleep(0.5)
                     except Exception as e:
@@ -642,7 +643,7 @@ async def push_daily_gte():
                     if not gte_data:
                         continue
                     message = format_gte_message(gte_data)
-                    await bot.send_group_msg(group_id=int(gid), message=message)
+                    await send_group_msg(bot, group_id=int(gid), message=message)
                     await asyncio.sleep(0.5)
                 except Exception as e:
                     logger.warning("status_monitor 向群{}推送日常失败: {}", gid, e)
@@ -773,10 +774,10 @@ async def push_daily_jjc_ranking():
 
         for gid in target_groups:
             try:
-                await bot.send_group_msg(
+                await send_group_msg(bot,
                     group_id=int(gid), message=MessageSegment.image(payload["image_bytes"])
                 )
-                await bot.send_group_msg(group_id=int(gid), message=summary_text)
+                await send_group_msg(bot, group_id=int(gid), message=summary_text)
                 if missing_kungfu_lines:
                     chunk_size = 100
                     total_lines = len(missing_kungfu_lines)
@@ -784,7 +785,7 @@ async def push_daily_jjc_ranking():
                         end = min(start + chunk_size, total_lines)
                         chunk_header = f"未查询到心法的角色（共{total_lines}人，第{start + 1}-{end}名）"
                         chunk_message = "\n".join(missing_kungfu_lines[start:end])
-                        await bot.send_group_msg(
+                        await send_group_msg(bot,
                             group_id=int(gid),
                             message=f"{chunk_header}\n{chunk_message}",
                         )
